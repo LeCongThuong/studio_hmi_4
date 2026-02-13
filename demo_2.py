@@ -1,8 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 import argparse
 import os
+import shutil
 from glob import glob
-import shutil 
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence
 
 import pyrootutils
 
@@ -16,64 +18,94 @@ root = pyrootutils.setup_root(
 import cv2
 import numpy as np
 import torch
-from sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
-from tools.vis_utils import (
-    visualize_sample,
-    visualize_sample_together,
-)
-from tools.utils import save_mesh_results 
+from sam_3d_body import SAM3DBodyEstimator, load_sam_3d_body
+from tools.utils import save_mesh_results
 from tqdm import tqdm
 
+IMAGE_EXTENSIONS: Sequence[str] = (
+    "*.jpg",
+    "*.jpeg",
+    "*.png",
+    "*.gif",
+    "*.bmp",
+    "*.tiff",
+    "*.webp",
+)
 
-def main(args):
-    if args.output_folder == "":
-        output_folder = os.path.join("./output", os.path.basename(args.image_folder))
-    else:
-        output_folder = args.output_folder
 
-    os.makedirs(output_folder, exist_ok=True)
+def resolve_output_folder(image_folder: str, output_folder: str) -> Path:
+    if output_folder:
+        return Path(output_folder)
+    return Path("./output") / Path(image_folder).name
 
-    # NEW: enforce dest_dir structure
-    render_root = os.path.join(output_folder, "render")
-    npy_root = os.path.join(output_folder, "npy")
-    mesh_root = os.path.join(output_folder, "mesh")  # NEW
-    os.makedirs(npy_root, exist_ok=True)
-    if args.debug:
-        os.makedirs(render_root, exist_ok=True)
-        os.makedirs(mesh_root, exist_ok=True)  # NEW
 
-    # Use command-line args or environment variables
+def ensure_output_dirs(output_root: Path, debug: bool) -> tuple[Path, Path, Path]:
+    render_root = output_root / "render"
+    npy_root = output_root / "npy"
+    mesh_root = output_root / "mesh"
+
+    npy_root.mkdir(parents=True, exist_ok=True)
+    if debug:
+        render_root.mkdir(parents=True, exist_ok=True)
+        mesh_root.mkdir(parents=True, exist_ok=True)
+
+    return render_root, npy_root, mesh_root
+
+
+def resolve_model_paths(args: argparse.Namespace) -> tuple[str, str, str, str]:
     mhr_path = args.mhr_path or os.environ.get("SAM3D_MHR_PATH", "")
     detector_path = args.detector_path or os.environ.get("SAM3D_DETECTOR_PATH", "")
     segmentor_path = args.segmentor_path or os.environ.get("SAM3D_SEGMENTOR_PATH", "")
     fov_path = args.fov_path or os.environ.get("SAM3D_FOV_PATH", "")
+    return mhr_path, detector_path, segmentor_path, fov_path
 
-    # Initialize sam-3d-body model and other optional modules
+
+def build_estimator(args: argparse.Namespace) -> SAM3DBodyEstimator:
+    mhr_path, detector_path, segmentor_path, fov_path = resolve_model_paths(args)
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
     model, model_cfg = load_sam_3d_body(
-        args.checkpoint_path, device=device, mhr_path=mhr_path
+        args.checkpoint_path,
+        device=device,
+        mhr_path=mhr_path,
     )
 
-    human_detector, human_segmentor, fov_estimator = None, None, None
+    human_detector = None
+    human_segmentor = None
+    fov_estimator = None
+
     if args.detector_name:
         from tools.build_detector import HumanDetector
 
         human_detector = HumanDetector(
-            name=args.detector_name, device=device, path=detector_path
+            name=args.detector_name,
+            device=device,
+            path=detector_path,
         )
 
-    if (args.segmentor_name == "sam2" and len(segmentor_path)) or args.segmentor_name != "sam2":
+    should_build_segmentor = (
+        args.segmentor_name != "sam2"
+        or (args.segmentor_name == "sam2" and len(segmentor_path) > 0)
+    )
+    if should_build_segmentor:
         from tools.build_sam import HumanSegmentor
 
         human_segmentor = HumanSegmentor(
-            name=args.segmentor_name, device=device, path=segmentor_path
+            name=args.segmentor_name,
+            device=device,
+            path=segmentor_path,
         )
+
     if args.fov_name:
         from tools.build_fov_estimator import FOVEstimator
 
-        fov_estimator = FOVEstimator(name=args.fov_name, device=device, path=fov_path)
+        fov_estimator = FOVEstimator(
+            name=args.fov_name,
+            device=device,
+            path=fov_path,
+        )
 
-    estimator = SAM3DBodyEstimator(
+    return SAM3DBodyEstimator(
         sam_3d_body_model=model,
         model_cfg=model_cfg,
         human_detector=human_detector,
@@ -81,24 +113,60 @@ def main(args):
         fov_estimator=fov_estimator,
     )
 
-    image_extensions = [
-        "*.jpg",
-        "*.jpeg",
-        "*.png",
-        "*.gif",
-        "*.bmp",
-        "*.tiff",
-        "*.webp",
-    ]
 
-    # NEW: recursive glob under root_dir (args.image_folder)
-    images_list = sorted(
-        [
-            image
-            for ext in image_extensions
-            for image in glob(os.path.join(args.image_folder, "**", ext), recursive=True)
-        ]
+def collect_images(image_root: str) -> List[str]:
+    return sorted(
+        image
+        for ext in IMAGE_EXTENSIONS
+        for image in glob(os.path.join(image_root, "**", ext), recursive=True)
     )
+
+
+def collect_ply_paths(ply_files: Optional[Iterable[str]]) -> List[str]:
+    if ply_files is None:
+        return []
+
+    if isinstance(ply_files, (list, tuple)):
+        candidates = [str(p) for p in ply_files if p is not None]
+    else:
+        candidates = [str(ply_files)]
+
+    return [p for p in candidates if os.path.isfile(p) and p.lower().endswith(".ply")]
+
+
+def move_mesh_files(
+    ply_files: Optional[Iterable[str]],
+    mesh_out_dir: Path,
+    image_name: str,
+) -> None:
+    ply_paths = collect_ply_paths(ply_files)
+    if not ply_paths:
+        return
+
+    if len(ply_paths) == 1:
+        shutil.move(ply_paths[0], mesh_out_dir / f"{image_name}.ply")
+        return
+
+    for src in ply_paths:
+        shutil.move(src, mesh_out_dir / Path(src).name)
+
+
+def save_npy(outputs: Optional[list], output_folder: Path, image_name: str) -> None:
+    if not outputs:
+        return
+
+    output_dict = outputs[0]
+    np.save(output_folder / f"{image_name}.npy", output_dict, allow_pickle=True)
+
+
+def main(args: argparse.Namespace) -> None:
+    output_root = resolve_output_folder(args.image_folder, args.output_folder)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    render_root, npy_root, mesh_root = ensure_output_dirs(output_root, args.debug)
+    estimator = build_estimator(args)
+
+    images_list = collect_images(args.image_folder)
 
     for image_path in tqdm(images_list):
         outputs = estimator.process_one_image(
@@ -106,66 +174,33 @@ def main(args):
             bbox_thr=args.bbox_thresh,
             use_mask=args.use_mask,
         )
-        # print("Key of outputs[0]:", outputs[0].keys())
-        # NEW: keep subfolder structure in output (dest_dir/{render,npy,mesh}/<rel_dir>/)
+
         rel_dir = os.path.relpath(os.path.dirname(image_path), args.image_folder)
         if rel_dir == ".":
             rel_dir = ""
-        image_name = os.path.splitext(os.path.basename(image_path))[0]
+        image_name = Path(image_path).stem
 
-        npy_out_dir = os.path.join(npy_root, rel_dir)
-        os.makedirs(npy_out_dir, exist_ok=True)
+        npy_out_dir = npy_root / rel_dir
+        npy_out_dir.mkdir(parents=True, exist_ok=True)
         save_npy(outputs, npy_out_dir, image_name)
 
-        # NEW: render + mesh only if --debug
-        if args.debug:
-            render_out_dir = os.path.join(render_root, rel_dir)
-            mesh_out_dir = os.path.join(mesh_root, rel_dir)  # NEW
-            os.makedirs(render_out_dir, exist_ok=True)
-            os.makedirs(mesh_out_dir, exist_ok=True)  # NEW
+        if not args.debug:
+            continue
 
-            img_cv2 = cv2.imread(image_path)
+        render_out_dir = render_root / rel_dir
+        mesh_out_dir = mesh_root / rel_dir
+        render_out_dir.mkdir(parents=True, exist_ok=True)
+        mesh_out_dir.mkdir(parents=True, exist_ok=True)
 
-            # Save all results (PLY meshes, overlay images, bbox images)
-            # NOTE: we write extras into render_out_dir, then move PLY(s) to mesh_out_dir
-            ply_files = save_mesh_results(
-                img_cv2, outputs, estimator.faces, render_out_dir, image_name
-            )
-
-            # Move PLY(s) into mesh/<rel_dir>/ (and rename if only 1 person)
-            if ply_files is not None:
-                if isinstance(ply_files, (list, tuple)):
-                    ply_list = list(ply_files)
-                else:
-                    ply_list = [ply_files]
-
-                # keep only existing .ply files
-                ply_paths = []
-                for p in ply_list:
-                    if p is None:
-                        continue
-                    src = str(p)
-                    if os.path.isfile(src) and src.lower().endswith(".ply"):
-                        ply_paths.append(src)
-
-                if len(ply_paths) == 1:
-                    # single person => single mesh => rename to <image_name>.ply
-                    src = ply_paths[0]
-                    dst = os.path.join(mesh_out_dir, f"{image_name}.ply")
-                    shutil.move(src, dst)
-                else:
-                    # multiple => keep original names
-                    for src in ply_paths:
-                        shutil.move(src, os.path.join(mesh_out_dir, os.path.basename(src)))
-
-def save_npy(outputs, output_folder, image_name):
-    if outputs is None or len(outputs) == 0:
-        return
-
-    output_dict = outputs[0]
-    
-    # Save as a single .npy (stores the whole dict as an object)
-    np.save(os.path.join(output_folder, f"{image_name}.npy"), output_dict, allow_pickle=True)
+        img_cv2 = cv2.imread(image_path)
+        ply_files = save_mesh_results(
+            img_cv2,
+            outputs,
+            estimator.faces,
+            str(render_out_dir),
+            image_name,
+        )
+        move_mesh_files(ply_files, mesh_out_dir, image_name)
 
 
 if __name__ == "__main__":
@@ -255,8 +290,6 @@ if __name__ == "__main__":
         default=False,
         help="Use mask-conditioned prediction (segmentation mask is automatically generated from bbox)",
     )
-
-    # NEW: debug flag for rendering/mesh export
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -265,5 +298,4 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-
     main(args)

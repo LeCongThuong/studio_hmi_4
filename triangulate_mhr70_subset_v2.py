@@ -95,12 +95,13 @@ def import_py_module(py_path: str):
 
 def find_existing_with_exts(dir_path: Path, stem: str, exts: List[str]) -> Optional[Path]:
     """Find stem+ext in a directory, supporting multiple possible extensions."""
+    exts_lower = [e.lower() for e in exts]
     for ext in exts:
         p = dir_path / f"{stem}{ext}"
         if p.exists():
             return p
     for p in dir_path.glob(stem + ".*"):
-        if p.suffix.lower() in [e.lower() for e in exts]:
+        if p.suffix.lower() in exts_lower:
             return p
     return None
 
@@ -958,7 +959,7 @@ def draw_overlay(img_bgr: np.ndarray, obs: np.ndarray, proj: np.ndarray, edges: 
 # CLI (keep existing args; add optional robust args)
 # -----------------------------
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mhr_py", required=True, help="Path to mhr_70.py (defines pose_info)")
     ap.add_argument("--caliscope_toml", required=True, help="Path to Caliscope config.toml")
@@ -996,6 +997,18 @@ def parse_args():
     return ap.parse_args()
 
 
+def resolve_toml_sections(
+    cams: List[str],
+    toml_sections_arg: Optional[List[str]],
+) -> List[str]:
+    if toml_sections_arg is None or len(toml_sections_arg) == 0:
+        return cams[:]
+
+    if len(toml_sections_arg) != len(cams):
+        raise ValueError("--toml_sections must match length of --cams (or omit).")
+    return toml_sections_arg
+
+
 def main():
     args = parse_args()
 
@@ -1006,11 +1019,7 @@ def main():
         # exactly what you said you have; pairs are hard-coded efficiently in init
         pass
 
-    toml_sections = args.toml_sections
-    if toml_sections is None or len(toml_sections) == 0:
-        toml_sections = cams[:]  # assume same
-    if len(toml_sections) != len(cams):
-        raise ValueError("--toml_sections must match length of --cams (or omit).")
+    toml_sections = resolve_toml_sections(cams, args.toml_sections)
 
     out_npz = Path(args.out_npz).expanduser().resolve()
     out_npz.parent.mkdir(parents=True, exist_ok=True)
@@ -1114,7 +1123,9 @@ def main():
                 ax = fig.add_subplot(111, projection="3d")
                 ax.scatter(X[:, 0], X[:, 1], X[:, 2], s=12)
                 ax.set_title("Triangulated 3D (refined)")
-                ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+                ax.set_xlabel("X")
+                ax.set_ylabel("Y")
+                ax.set_zlabel("Z")
                 fig.tight_layout()
                 fig.savefig(str(debug_dir / "triangulated_3d_refined.png"), dpi=160)
                 plt.close(fig)

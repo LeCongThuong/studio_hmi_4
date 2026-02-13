@@ -82,6 +82,8 @@ import av
 import numpy as np
 from PIL import Image
 
+VIDEO_EXTENSIONS = (".mp4", ".avi")
+
 
 # --------------------- CLI ---------------------
 
@@ -235,6 +237,11 @@ def load_session_meta(meta_path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def iter_video_files(video_dir: Path):
+    for ext in VIDEO_EXTENSIONS:
+        yield from video_dir.glob(f"*{ext}")
+
+
 def build_video_map_from_meta(root_dir: Path, meta: Optional[Dict[str, Any]], video_dir: Path) -> Dict[str, Path]:
     """
     Build slug -> video path mapping.
@@ -261,14 +268,32 @@ def build_video_map_from_meta(root_dir: Path, meta: Optional[Dict[str, Any]], vi
 
     # 2) Fallback scan
     if not video_map:
-        for p in list(video_dir.glob("*.mp4")) + list(video_dir.glob("*.avi")):
+        for p in iter_video_files(video_dir):
             video_map[p.stem] = p.resolve()
     else:
         # Still add any missing slugs from scan (in case meta is incomplete)
-        for p in list(video_dir.glob("*.mp4")) + list(video_dir.glob("*.avi")):
+        for p in iter_video_files(video_dir):
             video_map.setdefault(p.stem, p.resolve())
 
     return video_map
+
+
+def parse_camera_selection(
+    cams_arg: Optional[str],
+    cams_with_video: Set[str],
+) -> Set[str]:
+    if cams_arg is None or cams_arg.strip().lower() == "all":
+        return cams_with_video
+
+    requested = {c.strip() for c in cams_arg.split(",") if c.strip()}
+    missing = sorted(requested - cams_with_video)
+    if missing:
+        raise RuntimeError(
+            "Some requested cameras are not available as BOTH CSV column and video file:\n"
+            f"  missing: {missing}\n"
+            f"  available: {sorted(cams_with_video)}"
+        )
+    return requested
 
 
 # --------------------- image save ---------------------
@@ -322,7 +347,6 @@ def extract_for_one_camera_by_index(
 
     # Group targets by frame_idx (just in case duplicates occur)
     by_idx: Dict[int, List[Tuple[str, Optional[int]]]] = {}
-    wanted_indices: List[int] = []
     for frame_idx, id_str, tick_ms in targets:
         by_idx.setdefault(int(frame_idx), []).append((id_str, tick_ms))
     wanted_indices = sorted(by_idx.keys())
@@ -432,18 +456,7 @@ def main() -> None:
         )
 
     # Parse --cams
-    if args.cams is None or args.cams.strip().lower() == "all":
-        cam_keys = cams_with_video
-    else:
-        requested = {c.strip() for c in args.cams.split(",") if c.strip()}
-        missing = sorted(requested - cams_with_video)
-        if missing:
-            raise RuntimeError(
-                "Some requested cameras are not available as BOTH CSV column and video file:\n"
-                f"  missing: {missing}\n"
-                f"  available: {sorted(cams_with_video)}"
-            )
-        cam_keys = requested
+    cam_keys = parse_camera_selection(args.cams, cams_with_video)
 
     # Read targets from Recorder CSV
     _id_order, targets_by_cam = read_targets_from_recorder_csv(

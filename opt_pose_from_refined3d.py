@@ -40,6 +40,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
+DEFAULT_PARAM_DIMS = {
+    "hand_pose_params": 108,
+    "scale_params": 28,
+    "shape_params": 45,
+    "expr_params": 72,
+}
+
 
 # -----------------------------
 # Weighted Umeyama similarity
@@ -115,6 +122,14 @@ def find_npy_for_cam(npy_dir: Path, cam: str) -> Path:
     if len(matches) == 0:
         raise FileNotFoundError(f"Could not find {cam}.npy or *{cam}*.npy in {npy_dir}")
     raise RuntimeError(f"Ambiguous matches for cam='{cam}' in {npy_dir}: {[m.name for m in matches]}")
+
+
+def get_param_array(d: dict, key: str, device: torch.device) -> torch.Tensor:
+    if key in d:
+        return to_torch(d[key], device).flatten()
+
+    dim = DEFAULT_PARAM_DIMS[key]
+    return to_torch(np.zeros(dim, np.float32), device).flatten()
 
 
 # -----------------------------
@@ -350,10 +365,10 @@ def main():
         view_dicts[cam] = d
 
         pose133 = to_torch(d["body_pose_params"], device).flatten().to(torch.float32)
-        hand108 = to_torch(d.get("hand_pose_params", np.zeros(108, np.float32)), device).flatten()
-        scale28 = to_torch(d.get("scale_params", np.zeros(28, np.float32)), device).flatten()
-        shape45 = to_torch(d.get("shape_params", np.zeros(45, np.float32)), device).flatten()
-        expr72 = to_torch(d.get("expr_params", np.zeros(72, np.float32)), device).flatten()
+        hand108 = get_param_array(d, "hand_pose_params", device)
+        scale28 = get_param_array(d, "scale_params", device)
+        shape45 = get_param_array(d, "shape_params", device)
+        expr72 = get_param_array(d, "expr_params", device)
 
         # mask (NO in-place on leaf; this one isn't leaf anyway but keep consistent)
         pose_eff = pose133 * keep_mask
@@ -381,10 +396,10 @@ def main():
     init_dict = view_dicts[best_cam]
 
     init_pose = to_torch(init_dict["body_pose_params"], device).flatten().to(torch.float32)
-    init_hand = to_torch(init_dict.get("hand_pose_params", np.zeros(108, np.float32)), device).flatten()
-    init_scale = to_torch(init_dict.get("scale_params", np.zeros(28, np.float32)), device).flatten()
-    init_shape = to_torch(init_dict.get("shape_params", np.zeros(45, np.float32)), device).flatten()
-    init_expr = to_torch(init_dict.get("expr_params", np.zeros(72, np.float32)), device).flatten()
+    init_hand = get_param_array(init_dict, "hand_pose_params", device)
+    init_scale = get_param_array(init_dict, "scale_params", device)
+    init_shape = get_param_array(init_dict, "shape_params", device)
+    init_expr = get_param_array(init_dict, "expr_params", device)
 
     # Mask init pose (no in-place leaf issue here)
     init_pose = init_pose * keep_mask
