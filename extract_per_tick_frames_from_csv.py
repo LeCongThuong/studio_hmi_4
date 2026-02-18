@@ -16,9 +16,6 @@ Your recorder writes exactly ONE frame per camera per tick k, in order:
 So extraction can be exact and simple:
   - to get tick k for camera 'front', decode frame index k of videos/front.mp4
 
-No "nearest timestamp" logic is needed, no tolerance tuning, no anchoring monotonic
-timestamps to MP4 PTS. This is the cleanest possible mapping.
-
 Expected session folder structure
 ---------------------------------
 root_dir/
