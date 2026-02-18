@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 Optimize sam-3d-body body_pose_params (133-D) using GT 3D keypoints from your refined multi-view triangulation.
 
@@ -25,7 +26,7 @@ Outputs:
   - debug_dir: debug_opt.npz + plots
 
 Example:
-  python opt_pose_from_refined3d_v2.py \
+  python optimize_mhr_pose.py \
     --npz refined_points.npz \
     --npy_dir /path/to/sam_outputs \
     --cams left front right \
@@ -36,7 +37,9 @@ Example:
 """
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List, Optional
 import numpy as np
 import torch
 
@@ -46,6 +49,33 @@ DEFAULT_PARAM_DIMS = {
     "shape_params": 45,
     "expr_params": 72,
 }
+
+
+@dataclass
+class OptimizationConfig:
+    npz: Path
+    npy_dir: Path
+    cams: List[str]
+    out_npy: Path
+    debug_dir: Path = Path("debug_opt")
+    hf_repo: Optional[str] = None
+    ckpt: Optional[str] = None
+    mhr_pt: str = ""
+    device: str = "cuda"
+    iters: int = 200
+    lr: float = 5e-2
+    with_scale: bool = False
+    huber_m: float = 0.03
+    w_pose_reg: float = 1e-3
+    topk_print: int = 10
+
+
+@dataclass
+class OptimizationRunResult:
+    out_npy: Path
+    debug_dir: Path
+    best_cam: str
+    loss_history: List[float]
 
 
 # -----------------------------
@@ -135,14 +165,14 @@ def get_param_array(d: dict, key: str, device: torch.device) -> torch.Tensor:
 # -----------------------------
 # sam-3d-body forward FK helper
 # -----------------------------
-def load_sam_head(args, device_str):
+def load_sam_head(config: OptimizationConfig, device_str: str):
     from sam_3d_body.build_models import load_sam_3d_body, load_sam_3d_body_hf
 
-    if args.hf_repo:
-        model, _cfg = load_sam_3d_body_hf(args.hf_repo, device=device_str)
+    if config.hf_repo:
+        model, _cfg = load_sam_3d_body_hf(config.hf_repo, device=device_str)
     else:
         model, _cfg = load_sam_3d_body(
-            checkpoint_path=args.ckpt, device=device_str, mhr_path=args.mhr_pt
+            checkpoint_path=config.ckpt, device=device_str, mhr_path=config.mhr_pt
         )
     head = model.head_pose
     head.eval()
@@ -291,7 +321,7 @@ def write_ply(path: Path, verts: np.ndarray, faces: np.ndarray = None):
 # -----------------------------
 # Main
 # -----------------------------
-def main():
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", required=True, type=Path)
     ap.add_argument("--npy_dir", required=True, type=Path)
@@ -311,16 +341,49 @@ def main():
     ap.add_argument("--huber_m", type=float, default=0.03, help="Huber delta in meters")
     ap.add_argument("--w_pose_reg", type=float, default=1e-3)
     ap.add_argument("--topk_print", type=int, default=10)
-    args = ap.parse_args()
+    return ap
 
-    device = torch.device(args.device)
-    debug_dir = ensure_dir(args.debug_dir)
 
-    cams = list(args.cams)
-    npy_dir = args.npy_dir
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = build_arg_parser()
+    return parser.parse_args(argv)
+
+
+def namespace_to_config(args: argparse.Namespace) -> OptimizationConfig:
+    return OptimizationConfig(
+        npz=args.npz,
+        npy_dir=args.npy_dir,
+        cams=list(args.cams),
+        out_npy=args.out_npy,
+        debug_dir=args.debug_dir,
+        hf_repo=args.hf_repo,
+        ckpt=args.ckpt,
+        mhr_pt=args.mhr_pt,
+        device=args.device,
+        iters=args.iters,
+        lr=args.lr,
+        with_scale=args.with_scale,
+        huber_m=args.huber_m,
+        w_pose_reg=args.w_pose_reg,
+        topk_print=args.topk_print,
+    )
+
+
+def run_optimization(config: OptimizationConfig) -> OptimizationRunResult:
+    if not config.hf_repo and not config.ckpt:
+        raise ValueError("Either hf_repo or ckpt must be provided.")
+
+    device = torch.device(config.device)
+    debug_dir = ensure_dir(config.debug_dir.expanduser().resolve())
+    out_npy = config.out_npy.expanduser().resolve()
+    out_npy.parent.mkdir(parents=True, exist_ok=True)
+
+    cams = list(config.cams)
+    npy_dir = config.npy_dir.expanduser().resolve()
+    npz_path = config.npz.expanduser().resolve()
 
     # ---- Load refined GT npz ----
-    z = np.load(args.npz, allow_pickle=True)
+    z = np.load(npz_path, allow_pickle=True)
     subset_idx = z["subset_indices"].astype(np.int64).reshape(-1)   # (M,)
     subset_names = z.get("subset_names", None)
     gtM = z["points3d_refined"].astype(np.float32)                 # (M,3)
@@ -339,7 +402,7 @@ def main():
     wM_t = to_torch(wM, device)
 
     # ---- Load sam-3d-body head ----
-    head = load_sam_head(args, args.device)
+    head = load_sam_head(config, config.device)
 
     # ---- Build keep-mask for pose (fix autograd issue) ----
     from sam_3d_body.models.modules.mhr_utils import mhr_param_hand_mask
@@ -380,7 +443,7 @@ def main():
 
         predM = k70[subset_idx]  # (M,3)
 
-        s, R, t = umeyama_similarity(predM, gtM_t, w=wM_t, with_scale=args.with_scale)
+        s, R, t = umeyama_similarity(predM, gtM_t, w=wM_t, with_scale=config.with_scale)
         predM_aligned = s * (predM @ R.T) + t[None, :]
         r = torch.sqrt(((predM_aligned - gtM_t) ** 2).sum(dim=1) + 1e-12)
         score = (wM_t * r).sum() / (wM_t.sum() + 1e-9)
@@ -406,7 +469,7 @@ def main():
 
     # ---- Optimize pose (leaf tensor) ----
     pose = init_pose.clone().detach().requires_grad_(True)
-    opt = torch.optim.Adam([pose], lr=args.lr)
+    opt = torch.optim.Adam([pose], lr=config.lr)
 
     loss_hist = []
 
@@ -417,13 +480,13 @@ def main():
                       want_verts=False, want_joint=False, want_model_params=False)
         k70_0 = apply_repo_camera_flip_xyz(out0[1].squeeze(0)[:70])
         predM0 = k70_0[subset_idx]
-        s0, R0, t0 = umeyama_similarity(predM0, gtM_t, w=wM_t, with_scale=args.with_scale)
+        s0, R0, t0 = umeyama_similarity(predM0, gtM_t, w=wM_t, with_scale=config.with_scale)
         predM0_al = s0 * (predM0 @ R0.T) + t0[None, :]
         plot_3d_compare(gtM, predM0_al.cpu().numpy(),
                         f"Init ({best_cam}) aligned to GT (M={M})", debug_dir / "compare_init_subset.png")
 
     # main loop
-    for it in range(args.iters):
+    for it in range(config.iters):
         opt.zero_grad(set_to_none=True)
 
         # effective pose used in FK (NO in-place on pose)
@@ -435,14 +498,14 @@ def main():
         predM = k70[subset_idx]
 
         with torch.no_grad():
-            s, R, t = umeyama_similarity(predM.detach(), gtM_t, w=wM_t, with_scale=args.with_scale)
+            s, R, t = umeyama_similarity(predM.detach(), gtM_t, w=wM_t, with_scale=config.with_scale)
 
         predM_aligned = s * (predM @ R.T) + t[None, :]
         diff = predM_aligned - gtM_t
         r = torch.sqrt((diff * diff).sum(dim=1) + 1e-12)
 
-        loss_data = (wM_t * huber(r, delta=args.huber_m)).sum() / (wM_t.sum() + 1e-9)
-        loss_reg = args.w_pose_reg * torch.mean((pose - init_pose) ** 2)
+        loss_data = (wM_t * huber(r, delta=config.huber_m)).sum() / (wM_t.sum() + 1e-9)
+        loss_reg = config.w_pose_reg * torch.mean((pose - init_pose) ** 2)
         loss = loss_data + loss_reg
 
         loss.backward()
@@ -461,7 +524,7 @@ def main():
             pose.mul_(keep_mask)
 
         loss_hist.append(float(loss.detach().cpu().item()))
-        if it % 25 == 0 or it == args.iters - 1:
+        if it % 25 == 0 or it == config.iters - 1:
             print(f"[{it:04d}] loss={loss_hist[-1]:.6f} data={float(loss_data):.6f}")
 
     plot_loss_curve(loss_hist, debug_dir / "loss_curve.png")
@@ -481,7 +544,7 @@ def main():
 
         k70 = apply_repo_camera_flip_xyz(keypoints_308[:70])
         predM = k70[subset_idx]
-        s, R, t = umeyama_similarity(predM, gtM_t, w=wM_t, with_scale=args.with_scale)
+        s, R, t = umeyama_similarity(predM, gtM_t, w=wM_t, with_scale=config.with_scale)
 
         k70_aligned = s * (k70 @ R.T) + t[None, :]
         verts_aligned = s * (verts @ R.T) + t[None, :]
@@ -489,7 +552,7 @@ def main():
         jrots_aligned = R[None, :, :] @ jrots  # optional consistency
 
         rM = torch.sqrt(((k70_aligned[subset_idx] - gtM_t) ** 2).sum(dim=1) + 1e-12).cpu().numpy()
-        worst = np.argsort(-rM)[: args.topk_print]
+        worst = np.argsort(-rM)[: config.topk_print]
         print("\nTop residual points (subset indices):")
         for idx in worst:
             name = str(subset_names[idx]) if subset_names is not None else f"pt{idx}"
@@ -541,10 +604,23 @@ def main():
         out_dict["opt_subset_indices"] = subset_idx
         out_dict["opt_points3d_refined"] = gtM
 
-        np.save(args.out_npy, out_dict, allow_pickle=True)
+        np.save(out_npy, out_dict, allow_pickle=True)
 
-    print(f"\nSaved optimized npy: {args.out_npy}")
+    print(f"\nSaved optimized npy: {out_npy}")
     print(f"Saved debug dir: {debug_dir}")
+    return OptimizationRunResult(
+        out_npy=out_npy,
+        debug_dir=debug_dir,
+        best_cam=best_cam,
+        loss_history=loss_hist,
+    )
+
+
+def main(args: Optional[argparse.Namespace] = None) -> OptimizationRunResult:
+    if args is None:
+        args = parse_args()
+    config = namespace_to_config(args)
+    return run_optimization(config)
 
 
 if __name__ == "__main__":

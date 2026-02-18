@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-triangulate_mhr70_subset_ba.py
+triangulate_mhr3d_gt.py
 
 Triangulate + per-point Bundle Adjustment (Levenberg–Marquardt) for an MHR-70 subset
 (hands + shoulders + elbows + wrists) from multiple views.
@@ -44,7 +44,7 @@ Debug:
   Optional: --debug_dir (+ --img_dir) -> save 2D overlays to disk (not interactive)
 
 Example:
-  python triangulate_mhr70_subset_ba.py \
+  python triangulate_mhr3d_gt.py \
     --mhr_py /path/to/mhr_70.py \
     --caliscope_toml /path/to/config.toml \
     --cams front left right \
@@ -76,6 +76,41 @@ except Exception:
 
 IMG_EXTS = [".jpg", ".jpeg", ".png", ".bmp", ".webp"]
 NP_EXTS = [".npy", ".npz"]
+
+
+@dataclass
+class TriangulationConfig:
+    mhr_py: str
+    caliscope_toml: str
+    cams: List[str]
+    npy_dir: str
+    out_npz: str
+    toml_sections: Optional[List[str]] = None
+    index: int = 0
+    normalized: bool = False
+    pixel: bool = False
+    invert_extrinsics: bool = False
+    lm_iters: int = 25
+    lm_lambda: float = 1e-3
+    lm_eps: float = 1e-4
+    debug: bool = False
+    debug_dir: Optional[str] = None
+    img_dir: Optional[str] = None
+    score_type: str = "median"
+    huber_delta: float = 10.0
+    inlier_thresh: float = 30.0
+    robust_lm: bool = False
+    robust_lm_delta: float = 10.0
+
+
+@dataclass
+class TriangulationRunResult:
+    out_npz: Path
+    points3d_init: np.ndarray
+    points3d_refined: np.ndarray
+    mean_err_init: Dict[str, float]
+    mean_err_refined: Dict[str, float]
+    debug_dir: Optional[Path]
 
 
 # -----------------------------
@@ -959,7 +994,7 @@ def draw_overlay(img_bgr: np.ndarray, obs: np.ndarray, proj: np.ndarray, edges: 
 # CLI (keep existing args; add optional robust args)
 # -----------------------------
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mhr_py", required=True, help="Path to mhr_70.py (defines pose_info)")
     ap.add_argument("--caliscope_toml", required=True, help="Path to Caliscope config.toml")
@@ -994,7 +1029,12 @@ def parse_args() -> argparse.Namespace:
                     help="If set, use Huber-weighted residuals inside LM (robust BA)")
     ap.add_argument("--robust_lm_delta", type=float, default=10.0,
                     help="Delta for robust LM Huber weighting (pixels)")
-    return ap.parse_args()
+    return ap
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = build_arg_parser()
+    return parser.parse_args(argv)
 
 
 def resolve_toml_sections(
@@ -1009,53 +1049,81 @@ def resolve_toml_sections(
     return toml_sections_arg
 
 
-def main():
-    args = parse_args()
+def namespace_to_config(args: argparse.Namespace) -> TriangulationConfig:
+    return TriangulationConfig(
+        mhr_py=args.mhr_py,
+        caliscope_toml=args.caliscope_toml,
+        cams=list(args.cams),
+        toml_sections=args.toml_sections,
+        npy_dir=args.npy_dir,
+        out_npz=args.out_npz,
+        index=args.index,
+        normalized=args.normalized,
+        pixel=args.pixel,
+        invert_extrinsics=args.invert_extrinsics,
+        lm_iters=args.lm_iters,
+        lm_lambda=args.lm_lambda,
+        lm_eps=args.lm_eps,
+        debug=args.debug,
+        debug_dir=args.debug_dir,
+        img_dir=args.img_dir,
+        score_type=args.score_type,
+        huber_delta=args.huber_delta,
+        inlier_thresh=args.inlier_thresh,
+        robust_lm=args.robust_lm,
+        robust_lm_delta=args.robust_lm_delta,
+    )
 
-    cams = args.cams
+
+def run_triangulation(config: TriangulationConfig) -> TriangulationRunResult:
+    cams = list(config.cams)
     if len(cams) < 2:
         raise ValueError("Need at least 2 cameras for triangulation/BA.")
     if len(cams) == 3:
         # exactly what you said you have; pairs are hard-coded efficiently in init
         pass
 
-    toml_sections = resolve_toml_sections(cams, args.toml_sections)
+    toml_sections = resolve_toml_sections(cams, config.toml_sections)
 
-    out_npz = Path(args.out_npz).expanduser().resolve()
+    out_npz = Path(config.out_npz).expanduser().resolve()
     out_npz.parent.mkdir(parents=True, exist_ok=True)
 
     debug_dir = None
-    if args.debug_dir is not None:
-        debug_dir = Path(args.debug_dir).expanduser().resolve()
+    if config.debug_dir is not None:
+        debug_dir = Path(config.debug_dir).expanduser().resolve()
         debug_dir.mkdir(parents=True, exist_ok=True)
 
-    img_dir = Path(args.img_dir).expanduser().resolve() if args.img_dir is not None else None
+    img_dir = Path(config.img_dir).expanduser().resolve() if config.img_dir is not None else None
 
     # 1) subset
-    selector = MHRSubsetSelector(args.mhr_py)
+    selector = MHRSubsetSelector(config.mhr_py)
     subset = selector.build_subset()
 
     # 2) cameras
-    rig = CaliscopeRig(args.caliscope_toml)
-    cameras = rig.build_cameras(cams=cams, toml_sections=toml_sections, invert_extrinsics=args.invert_extrinsics)
+    rig = CaliscopeRig(config.caliscope_toml)
+    cameras = rig.build_cameras(
+        cams=cams,
+        toml_sections=toml_sections,
+        invert_extrinsics=config.invert_extrinsics,
+    )
 
     # 3) pipeline
     pipe = TriangulatorBA(
         cams=cams,
         cameras=cameras,
         subset=subset,
-        npy_dir=args.npy_dir,
-        index=args.index,
-        force_normalized=args.normalized,
-        force_pixel=args.pixel,
-        lm_iters=args.lm_iters,
-        lm_lambda=args.lm_lambda,
-        lm_eps=args.lm_eps,
-        score_type=args.score_type,
-        huber_delta=args.huber_delta,
-        inlier_thresh=args.inlier_thresh,
-        robust_lm=args.robust_lm,
-        robust_lm_delta=args.robust_lm_delta,
+        npy_dir=config.npy_dir,
+        index=config.index,
+        force_normalized=config.normalized,
+        force_pixel=config.pixel,
+        lm_iters=config.lm_iters,
+        lm_lambda=config.lm_lambda,
+        lm_eps=config.lm_eps,
+        score_type=config.score_type,
+        huber_delta=config.huber_delta,
+        inlier_thresh=config.inlier_thresh,
+        robust_lm=config.robust_lm,
+        robust_lm_delta=config.robust_lm_delta,
     )
     pipe.load_observations()
 
@@ -1135,8 +1203,24 @@ def main():
         print(f"[DEBUG] Saved debug files in: {debug_dir}")
 
     # 6) interactive 3D only
-    if args.debug:
+    if config.debug:
         show_3d_scatter_interactive(points3d_ref, title="Triangulated 3D (refined)")
+
+    return TriangulationRunResult(
+        out_npz=out_npz,
+        points3d_init=points3d_init,
+        points3d_refined=points3d_ref,
+        mean_err_init=mean_init,
+        mean_err_refined=mean_ref,
+        debug_dir=debug_dir,
+    )
+
+
+def main(args: Optional[argparse.Namespace] = None) -> TriangulationRunResult:
+    if args is None:
+        args = parse_args()
+    config = namespace_to_config(args)
+    return run_triangulation(config)
 
 
 if __name__ == "__main__":
