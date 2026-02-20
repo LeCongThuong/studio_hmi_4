@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 """
 Optimize sam-3d-body body_pose_params (133-D) using GT 3D keypoints from your refined multi-view triangulation.
 
@@ -35,11 +34,12 @@ Example:
     --debug_dir debug_opt \
     --out_npy opt_out.npy
 """
+from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 import numpy as np
 import torch
 
@@ -53,6 +53,8 @@ DEFAULT_PARAM_DIMS = {
 
 @dataclass
 class OptimizationConfig:
+    """Configuration for stage-3 pose optimization against triangulated 3D GT."""
+
     npz: Path
     npy_dir: Path
     cams: List[str]
@@ -68,14 +70,30 @@ class OptimizationConfig:
     huber_m: float = 0.03
     w_pose_reg: float = 1e-3
     topk_print: int = 10
+    save_debug_artifacts: bool = True
+    min_iters: int = 50
+    early_stop_patience: int = 60
+    early_stop_tol: float = 1e-6
 
 
 @dataclass
 class OptimizationRunResult:
+    """Outputs from stage-3 optimization."""
+
     out_npy: Path
     debug_dir: Path
     best_cam: str
     loss_history: List[float]
+
+
+@dataclass
+class OptimizationRuntime:
+    """Reusable runtime state for repeated optimizations on the same model."""
+
+    device: torch.device
+    head: Any
+    hand_mask: torch.Tensor
+    keep_mask: torch.Tensor
 
 
 # -----------------------------
@@ -177,6 +195,27 @@ def load_sam_head(config: OptimizationConfig, device_str: str):
     head = model.head_pose
     head.eval()
     return head
+
+
+def build_optimization_runtime(config: OptimizationConfig) -> OptimizationRuntime:
+    """Build reusable model/runtime tensors for repeated frame optimizations."""
+
+    device = torch.device(config.device)
+    head = load_sam_head(config, config.device)
+
+    from sam_3d_body.models.modules.mhr_utils import mhr_param_hand_mask
+
+    hand_mask = mhr_param_hand_mask.to(device)  # bool (133,)
+    keep_mask = torch.ones(133, device=device, dtype=torch.float32)
+    keep_mask[hand_mask] = 0.0
+    keep_mask[-3:] = 0.0  # jaw
+
+    return OptimizationRuntime(
+        device=device,
+        head=head,
+        hand_mask=hand_mask,
+        keep_mask=keep_mask,
+    )
 
 
 def apply_repo_camera_flip_xyz(x):
@@ -322,6 +361,8 @@ def write_ply(path: Path, verts: np.ndarray, faces: np.ndarray = None):
 # Main
 # -----------------------------
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build CLI parser for standalone stage-3 optimization."""
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", required=True, type=Path)
     ap.add_argument("--npy_dir", required=True, type=Path)
@@ -341,15 +382,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--huber_m", type=float, default=0.03, help="Huber delta in meters")
     ap.add_argument("--w_pose_reg", type=float, default=1e-3)
     ap.add_argument("--topk_print", type=int, default=10)
+    ap.add_argument("--no_debug_artifacts", action="store_true", help="Skip debug plots/npz/ply for faster execution.")
+    ap.add_argument("--min_iters", type=int, default=50, help="Minimum iterations before early stopping is allowed.")
+    ap.add_argument("--early_stop_patience", type=int, default=60, help="Stop after this many non-improving iterations.")
+    ap.add_argument("--early_stop_tol", type=float, default=1e-6, help="Minimum loss improvement to reset patience.")
     return ap
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse CLI args for stage-3 optimization."""
+
     parser = build_arg_parser()
     return parser.parse_args(argv)
 
 
 def namespace_to_config(args: argparse.Namespace) -> OptimizationConfig:
+    """Convert parsed CLI args to `OptimizationConfig`."""
+
     return OptimizationConfig(
         npz=args.npz,
         npy_dir=args.npy_dir,
@@ -366,15 +415,39 @@ def namespace_to_config(args: argparse.Namespace) -> OptimizationConfig:
         huber_m=args.huber_m,
         w_pose_reg=args.w_pose_reg,
         topk_print=args.topk_print,
+        save_debug_artifacts=not args.no_debug_artifacts,
+        min_iters=args.min_iters,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_tol=args.early_stop_tol,
     )
 
 
-def run_optimization(config: OptimizationConfig) -> OptimizationRunResult:
+def run_optimization(
+    config: OptimizationConfig,
+    runtime: Optional[OptimizationRuntime] = None,
+) -> OptimizationRunResult:
+    """Run optimization of body pose parameters using refined multi-view 3D points.
+
+    Core idea:
+    1. Score each camera-specific SAM initialization in 3D against triangulated GT.
+    2. Pick the best initialization and optimize a shared body pose vector.
+    3. Re-run MHR forward pass and write optimized mesh/keypoint outputs.
+    """
+
     if not config.hf_repo and not config.ckpt:
         raise ValueError("Either hf_repo or ckpt must be provided.")
 
-    device = torch.device(config.device)
-    debug_dir = ensure_dir(config.debug_dir.expanduser().resolve())
+    if runtime is None:
+        runtime = build_optimization_runtime(config)
+
+    device = runtime.device
+    head = runtime.head
+    hand_mask = runtime.hand_mask
+    keep_mask = runtime.keep_mask
+
+    debug_dir = config.debug_dir.expanduser().resolve()
+    if config.save_debug_artifacts:
+        ensure_dir(debug_dir)
     out_npy = config.out_npy.expanduser().resolve()
     out_npy.parent.mkdir(parents=True, exist_ok=True)
 
@@ -400,16 +473,6 @@ def run_optimization(config: OptimizationConfig) -> OptimizationRunResult:
 
     gtM_t = to_torch(gtM, device)
     wM_t = to_torch(wM, device)
-
-    # ---- Load sam-3d-body head ----
-    head = load_sam_head(config, config.device)
-
-    # ---- Build keep-mask for pose (fix autograd issue) ----
-    from sam_3d_body.models.modules.mhr_utils import mhr_param_hand_mask
-    hand_mask = mhr_param_hand_mask.to(device)  # bool (133,)
-    keep_mask = torch.ones(133, device=device, dtype=torch.float32)
-    keep_mask[hand_mask] = 0.0
-    keep_mask[-3:] = 0.0  # jaw
 
     # ---- Load per-view SAM outputs and score them ----
     view_scores_3d = {}
@@ -474,18 +537,28 @@ def run_optimization(config: OptimizationConfig) -> OptimizationRunResult:
     loss_hist = []
 
     # debug init plot
-    with torch.no_grad():
-        pose_eff0 = pose.detach() * keep_mask
-        out0 = mhr_fk(head, pose_eff0, init_hand, init_scale, init_shape, init_expr, device,
-                      want_verts=False, want_joint=False, want_model_params=False)
-        k70_0 = apply_repo_camera_flip_xyz(out0[1].squeeze(0)[:70])
-        predM0 = k70_0[subset_idx]
-        s0, R0, t0 = umeyama_similarity(predM0, gtM_t, w=wM_t, with_scale=config.with_scale)
-        predM0_al = s0 * (predM0 @ R0.T) + t0[None, :]
-        plot_3d_compare(gtM, predM0_al.cpu().numpy(),
-                        f"Init ({best_cam}) aligned to GT (M={M})", debug_dir / "compare_init_subset.png")
+    if config.save_debug_artifacts:
+        with torch.no_grad():
+            pose_eff0 = pose.detach() * keep_mask
+            out0 = mhr_fk(head, pose_eff0, init_hand, init_scale, init_shape, init_expr, device,
+                          want_verts=False, want_joint=False, want_model_params=False)
+            k70_0 = apply_repo_camera_flip_xyz(out0[1].squeeze(0)[:70])
+            predM0 = k70_0[subset_idx]
+            s0, R0, t0 = umeyama_similarity(predM0, gtM_t, w=wM_t, with_scale=config.with_scale)
+            predM0_al = s0 * (predM0 @ R0.T) + t0[None, :]
+            plot_3d_compare(
+                gtM,
+                predM0_al.cpu().numpy(),
+                f"Init ({best_cam}) aligned to GT (M={M})",
+                debug_dir / "compare_init_subset.png",
+            )
 
     # main loop
+    min_iters = max(1, min(int(config.min_iters), int(config.iters)))
+    patience = max(1, int(config.early_stop_patience))
+    improve_tol = max(0.0, float(config.early_stop_tol))
+    best_loss = float("inf")
+    no_improve = 0
     for it in range(config.iters):
         opt.zero_grad(set_to_none=True)
 
@@ -527,7 +600,18 @@ def run_optimization(config: OptimizationConfig) -> OptimizationRunResult:
         if it % 25 == 0 or it == config.iters - 1:
             print(f"[{it:04d}] loss={loss_hist[-1]:.6f} data={float(loss_data):.6f}")
 
-    plot_loss_curve(loss_hist, debug_dir / "loss_curve.png")
+        cur_loss = loss_hist[-1]
+        if cur_loss < (best_loss - improve_tol):
+            best_loss = cur_loss
+            no_improve = 0
+        else:
+            no_improve += 1
+        if (it + 1) >= min_iters and no_improve >= patience:
+            print(f"[early-stop] iter={it:04d} best_loss={best_loss:.6f}")
+            break
+
+    if config.save_debug_artifacts:
+        plot_loss_curve(loss_hist, debug_dir / "loss_curve.png")
 
     # final forward (full outputs)
     with torch.no_grad():
@@ -558,31 +642,36 @@ def run_optimization(config: OptimizationConfig) -> OptimizationRunResult:
             name = str(subset_names[idx]) if subset_names is not None else f"pt{idx}"
             print(f"  {idx:02d} ({name}): {rM[idx]:.4f} m")
 
-        plot_3d_compare(gtM, k70_aligned[subset_idx].cpu().numpy(),
-                        f"Optimized aligned to GT (M={M})", debug_dir / "compare_opt_subset.png")
+        if config.save_debug_artifacts:
+            plot_3d_compare(
+                gtM,
+                k70_aligned[subset_idx].cpu().numpy(),
+                f"Optimized aligned to GT (M={M})",
+                debug_dir / "compare_opt_subset.png",
+            )
 
-        faces = init_dict.get("faces", None)
-        if faces is not None:
-            write_ply(debug_dir / "mesh_opt_aligned.ply", verts_aligned.cpu().numpy(), faces)
-        else:
-            write_ply(debug_dir / "verts_opt_aligned.ply", verts_aligned.cpu().numpy(), None)
+            faces = init_dict.get("faces", None)
+            if faces is not None:
+                write_ply(debug_dir / "mesh_opt_aligned.ply", verts_aligned.cpu().numpy(), faces)
+            else:
+                write_ply(debug_dir / "verts_opt_aligned.ply", verts_aligned.cpu().numpy(), None)
 
-        np.savez_compressed(
-            debug_dir / "debug_opt.npz",
-            best_cam=np.array(best_cam, dtype=object),
-            cams=np.array(cams, dtype=object),
-            subset_idx=subset_idx,
-            gt_subset=gtM,
-            w_subset=wM,
-            init_scores_3d_m=np.array([view_scores_3d[c] for c in cams], dtype=np.float32),
-            init_scores_mean_px=np.array([view_mean_px[c] for c in cams], dtype=np.float32),
-            final_scale=np.array(float(s.cpu().item()), dtype=np.float32),
-            final_R=R.cpu().numpy(),
-            final_t=t.cpu().numpy(),
-            loss_hist=np.array(loss_hist, dtype=np.float32),
-            residual_subset_m=np.array(rM, dtype=np.float32),
-            keep_mask=keep_mask.cpu().numpy(),
-        )
+            np.savez_compressed(
+                debug_dir / "debug_opt.npz",
+                best_cam=np.array(best_cam, dtype=object),
+                cams=np.array(cams, dtype=object),
+                subset_idx=subset_idx,
+                gt_subset=gtM,
+                w_subset=wM,
+                init_scores_3d_m=np.array([view_scores_3d[c] for c in cams], dtype=np.float32),
+                init_scores_mean_px=np.array([view_mean_px[c] for c in cams], dtype=np.float32),
+                final_scale=np.array(float(s.cpu().item()), dtype=np.float32),
+                final_R=R.cpu().numpy(),
+                final_t=t.cpu().numpy(),
+                loss_hist=np.array(loss_hist, dtype=np.float32),
+                residual_subset_m=np.array(rM, dtype=np.float32),
+                keep_mask=keep_mask.cpu().numpy(),
+            )
 
         # output npy dict in same style as SAM output
         out_dict = dict(init_dict)
@@ -607,7 +696,10 @@ def run_optimization(config: OptimizationConfig) -> OptimizationRunResult:
         np.save(out_npy, out_dict, allow_pickle=True)
 
     print(f"\nSaved optimized npy: {out_npy}")
-    print(f"Saved debug dir: {debug_dir}")
+    if config.save_debug_artifacts:
+        print(f"Saved debug dir: {debug_dir}")
+    else:
+        print("Debug artifacts disabled (--no_debug_artifacts).")
     return OptimizationRunResult(
         out_npy=out_npy,
         debug_dir=debug_dir,
@@ -617,6 +709,8 @@ def run_optimization(config: OptimizationConfig) -> OptimizationRunResult:
 
 
 def main(args: Optional[argparse.Namespace] = None) -> OptimizationRunResult:
+    """CLI/programmatic entrypoint for stage-3 optimization."""
+
     if args is None:
         args = parse_args()
     config = namespace_to_config(args)

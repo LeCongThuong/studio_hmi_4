@@ -1,4 +1,16 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+"""Stage 1: Run SAM-3D inference on image folders and persist per-frame artifacts.
+
+Core idea:
+1. Build a SAM-3D estimator (pose model + optional detector/segmentor/FOV models).
+2. Run per-image inference to produce a prediction dict.
+3. Save canonical `.npy` outputs used by downstream triangulation/optimization stages.
+4. Optionally save render/mesh debug outputs and extracted MHR parameter sidecars.
+
+This module is intentionally usable in two ways:
+- CLI script for quick debugging.
+- Importable API (`Demo2Config`, `run_demo`) for orchestration in a larger pipeline.
+"""
 from __future__ import annotations
 
 import argparse
@@ -46,6 +58,8 @@ MHR_PARAM_KEYS: Sequence[str] = (
 
 @dataclass
 class Demo2Config:
+    """Configuration for stage-1 SAM-3D inference."""
+
     image_folder: str
     checkpoint_path: str
     output_folder: str = ""
@@ -60,10 +74,13 @@ class Demo2Config:
     use_mask: bool = False
     debug: bool = False
     save_mhr_params: bool = False
+    include_rel_dirs: Optional[List[str]] = None
 
 
 @dataclass
 class FrameResult:
+    """Per-image output summary returned by `run_demo`."""
+
     image_path: Path
     rel_dir: str
     npy_path: Optional[Path]
@@ -73,6 +90,8 @@ class FrameResult:
 
 @dataclass
 class Demo2RunResult:
+    """Aggregated stage-1 output locations and frame-level status."""
+
     output_root: Path
     npy_root: Path
     render_root: Path
@@ -82,6 +101,8 @@ class Demo2RunResult:
 
 
 def resolve_output_folder(image_folder: str, output_folder: str) -> Path:
+    """Resolve output directory, defaulting to `./output/<image_folder_name>`."""
+
     if output_folder:
         return Path(output_folder)
     return Path("./output") / Path(image_folder).name
@@ -116,6 +137,8 @@ def resolve_model_paths(config: Demo2Config) -> tuple[str, str, str, str]:
 
 
 def build_estimator(config: Demo2Config) -> SAM3DBodyEstimator:
+    """Construct the SAM-3D estimator and optional auxiliary models."""
+
     mhr_path, detector_path, segmentor_path, fov_path = resolve_model_paths(config)
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -253,11 +276,31 @@ def _relative_dir(image_path: str, image_root: str) -> str:
     return rel_dir
 
 
+def _normalize_rel_dir(rel_dir: str) -> str:
+    norm = rel_dir.replace("\\", "/").strip("/")
+    return norm
+
+
+def _filter_images_by_rel_dirs(images: List[str], image_root: str, rel_dirs: Sequence[str]) -> List[str]:
+    allowed = {_normalize_rel_dir(r) for r in rel_dirs}
+    filtered: List[str] = []
+    for image_path in images:
+        rel_dir = _normalize_rel_dir(_relative_dir(image_path, image_root))
+        if rel_dir in allowed:
+            filtered.append(image_path)
+    return filtered
+
+
 def run_demo(
     config: Demo2Config,
     estimator: Optional[SAM3DBodyEstimator] = None,
     show_progress: bool = True,
 ) -> Demo2RunResult:
+    """Execute stage-1 inference for all images under `config.image_folder`.
+
+    Returns a `Demo2RunResult` containing output roots and per-frame save status.
+    """
+
     output_root = resolve_output_folder(config.image_folder, config.output_folder)
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -270,6 +313,12 @@ def run_demo(
         estimator = build_estimator(config)
 
     images_list = collect_images(config.image_folder)
+    if config.include_rel_dirs:
+        images_list = _filter_images_by_rel_dirs(
+            images=images_list,
+            image_root=config.image_folder,
+            rel_dirs=config.include_rel_dirs,
+        )
     frames: List[FrameResult] = []
 
     if len(images_list) == 0:
@@ -343,6 +392,8 @@ def run_demo(
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for standalone stage-1 execution."""
+
     parser = argparse.ArgumentParser(
         description="SAM 3D Body Demo - Single Image Human Mesh Recovery",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -441,6 +492,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="If set, save extracted MHR params to <output_folder>/mhr_params/<rel_path>/<image>.npy.",
     )
+    parser.add_argument(
+        "--include_rel_dirs",
+        nargs="*",
+        default=None,
+        help="Optional relative subdirs under image_folder to process (e.g., 100 101).",
+    )
     return parser
 
 
@@ -450,6 +507,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def namespace_to_config(args: argparse.Namespace) -> Demo2Config:
+    """Convert parsed CLI args to `Demo2Config`."""
+
     return Demo2Config(
         image_folder=args.image_folder,
         checkpoint_path=args.checkpoint_path,
@@ -465,10 +524,13 @@ def namespace_to_config(args: argparse.Namespace) -> Demo2Config:
         use_mask=args.use_mask,
         debug=args.debug,
         save_mhr_params=args.save_mhr_params,
+        include_rel_dirs=args.include_rel_dirs,
     )
 
 
 def main(args: Optional[argparse.Namespace] = None) -> Demo2RunResult:
+    """CLI/programmatic entrypoint for stage-1 inference."""
+
     if args is None:
         args = parse_args()
     config = namespace_to_config(args)

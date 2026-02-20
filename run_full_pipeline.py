@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""Unified end-to-end runner for SAM-3D body fitting across all pipeline stages.
+
+Pipeline stages:
+1. Stage-1 (`sam3d_inference.py`): infer per-view 2D/3D outputs from images.
+2. Stage-2 (`triangulate_mhr3d_gt.py`): triangulate subset 3D GT with robust BA.
+3. Stage-3 (`optimize_mhr_pose.py`): optimize MHR pose parameters to triangulated GT.
+
+The runner supports both one-shot execution and partial reruns via `--skip_*` flags.
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +16,11 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 from sam3d_inference import Demo2Config, run_demo
-from optimize_mhr_pose import OptimizationConfig, run_optimization
+from optimize_mhr_pose import (
+    OptimizationConfig,
+    build_optimization_runtime,
+    run_optimization,
+)
 from triangulate_mhr3d_gt import (
     NP_EXTS,
     TriangulationConfig,
@@ -18,6 +31,8 @@ from triangulate_mhr3d_gt import (
 
 @dataclass
 class FullPipelineConfig:
+    """Configuration for orchestrating all pipeline stages."""
+
     image_folder: str
     output_root: str
     cams: List[str]
@@ -40,6 +55,7 @@ class FullPipelineConfig:
     skip_inference: bool = False
     skip_triangulation: bool = False
     skip_optimization: bool = False
+    overwrite: bool = False
     npy_root: Optional[str] = None
     triangulated_name: str = "triangulated.npz"
     optimized_name: str = "opt_out.npy"
@@ -66,10 +82,13 @@ class FullPipelineConfig:
     huber_m: float = 0.03
     w_pose_reg: float = 1e-3
     topk_print: int = 10
+    save_opt_debug: bool = False
 
 
 @dataclass
 class FramePipelineResult:
+    """Per-frame summary produced by the full pipeline."""
+
     rel_dir: str
     npy_dir: Path
     triangulated_npz: Path
@@ -78,6 +97,8 @@ class FramePipelineResult:
 
 @dataclass
 class FullPipelineResult:
+    """Aggregated output of the full pipeline run."""
+
     output_root: Path
     npy_root: Path
     frames: List[FramePipelineResult]
@@ -95,6 +116,8 @@ def discover_frame_dirs(
     cams: Sequence[str],
     frame_rel: Optional[str] = None,
 ) -> List[Path]:
+    """Discover frame directories containing one prediction file per camera."""
+
     if frame_rel:
         target = (npy_root / frame_rel).resolve()
         if not target.is_dir():
@@ -118,6 +141,8 @@ def _rel_key(path: Path, root: Path) -> str:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build CLI parser for full pipeline orchestration."""
+
     ap = argparse.ArgumentParser(
         description="Run SAM -> triangulation -> optimization as one full pipeline."
     )
@@ -152,6 +177,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--skip_inference", action="store_true", default=False)
     ap.add_argument("--skip_triangulation", action="store_true", default=False)
     ap.add_argument("--skip_optimization", action="store_true", default=False)
+    ap.add_argument("--overwrite", action="store_true", default=False, help="Recompute outputs even when they already exist.")
     ap.add_argument("--npy_root", default=None, type=str, help="Existing npy root (used when --skip_inference).")
     ap.add_argument("--triangulated_name", default="triangulated.npz", type=str)
     ap.add_argument("--optimized_name", default="opt_out.npy", type=str)
@@ -183,15 +209,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--huber_m", type=float, default=0.03)
     ap.add_argument("--w_pose_reg", type=float, default=1e-3)
     ap.add_argument("--topk_print", type=int, default=10)
+    ap.add_argument("--save_opt_debug", action="store_true", default=False, help="Save optimization debug plots/artifacts.")
     return ap
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse CLI args for full pipeline execution."""
+
     parser = build_arg_parser()
     return parser.parse_args(argv)
 
 
 def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
+    """Convert parsed CLI args to `FullPipelineConfig`."""
+
     return FullPipelineConfig(
         image_folder=args.image_folder,
         output_root=args.output_root,
@@ -215,6 +246,7 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
         skip_inference=args.skip_inference,
         skip_triangulation=args.skip_triangulation,
         skip_optimization=args.skip_optimization,
+        overwrite=args.overwrite,
         npy_root=args.npy_root,
         triangulated_name=args.triangulated_name,
         optimized_name=args.optimized_name,
@@ -241,10 +273,19 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
         huber_m=args.huber_m,
         w_pose_reg=args.w_pose_reg,
         topk_print=args.topk_print,
+        save_opt_debug=args.save_opt_debug,
     )
 
 
 def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
+    """Run all enabled stages and return per-frame outputs.
+
+    Core idea:
+    - Stage-1 creates/loads per-camera SAM predictions.
+    - Frame folders are discovered under the stage-1 `npy` tree.
+    - Stage-2 and stage-3 run per frame folder and write deterministic outputs.
+    """
+
     image_root = Path(config.image_folder).expanduser().resolve()
     output_root = Path(config.output_root).expanduser().resolve()
     inference_root = output_root / "inference"
@@ -269,24 +310,40 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
         if not npy_root.is_dir():
             raise FileNotFoundError(f"Numpy root not found: {npy_root}")
     else:
-        demo_cfg = Demo2Config(
-            image_folder=str(image_root),
-            output_folder=str(inference_root),
-            checkpoint_path=config.checkpoint_path,
-            detector_name=config.detector_name,
-            segmentor_name=config.segmentor_name,
-            fov_name=config.fov_name,
-            detector_path=config.detector_path,
-            segmentor_path=config.segmentor_path,
-            fov_path=config.fov_path,
-            mhr_path=config.mhr_path,
-            bbox_thresh=config.bbox_thresh,
-            use_mask=config.use_mask,
-            debug=config.debug_inference,
-            save_mhr_params=config.save_mhr_params,
-        )
-        demo_result = run_demo(demo_cfg)
-        npy_root = demo_result.npy_root.resolve()
+        inferred_npy_root = (inference_root / "npy").resolve()
+        reuse_stage1 = False
+        if (
+            not config.overwrite
+            and config.frame_rel is not None
+            and inferred_npy_root.is_dir()
+        ):
+            rel_dir = (inferred_npy_root / config.frame_rel).resolve()
+            if rel_dir.is_dir() and _dir_has_all_cam_predictions(rel_dir, config.cams):
+                reuse_stage1 = True
+
+        if reuse_stage1:
+            npy_root = inferred_npy_root
+            print(f"[PIPELINE] Reusing existing stage-1 outputs at: {npy_root}")
+        else:
+            demo_cfg = Demo2Config(
+                image_folder=str(image_root),
+                output_folder=str(inference_root),
+                checkpoint_path=config.checkpoint_path,
+                detector_name=config.detector_name,
+                segmentor_name=config.segmentor_name,
+                fov_name=config.fov_name,
+                detector_path=config.detector_path,
+                segmentor_path=config.segmentor_path,
+                fov_path=config.fov_path,
+                mhr_path=config.mhr_path,
+                bbox_thresh=config.bbox_thresh,
+                use_mask=config.use_mask,
+                debug=config.debug_inference,
+                save_mhr_params=config.save_mhr_params,
+                include_rel_dirs=[config.frame_rel] if config.frame_rel else None,
+            )
+            demo_result = run_demo(demo_cfg)
+            npy_root = demo_result.npy_root.resolve()
 
     frame_dirs = discover_frame_dirs(
         npy_root=npy_root,
@@ -297,6 +354,22 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
         raise FileNotFoundError(
             f"No frame directories with all cams {config.cams} found under {npy_root}"
         )
+
+    opt_runtime = None
+    if not config.skip_optimization:
+        runtime_cfg = OptimizationConfig(
+            npz=Path("runtime.npz"),
+            npy_dir=frame_dirs[0],
+            cams=list(config.cams),
+            out_npy=Path("runtime.npy"),
+            debug_dir=(optimization_root / "debug_opt"),
+            hf_repo=config.hf_repo,
+            ckpt=opt_ckpt,
+            mhr_pt=opt_mhr_pt,
+            device=config.device,
+            save_debug_artifacts=False,
+        )
+        opt_runtime = build_optimization_runtime(runtime_cfg)
 
     frame_results: List[FramePipelineResult] = []
     for idx, frame_npy_dir in enumerate(frame_dirs, start=1):
@@ -311,53 +384,60 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
         img_dir = rel_img_dir if rel_img_dir.is_dir() else image_root
 
         if not config.skip_triangulation:
-            tri_cfg = TriangulationConfig(
-                mhr_py=config.mhr_py,
-                caliscope_toml=config.caliscope_toml,
-                cams=list(config.cams),
-                toml_sections=config.toml_sections,
-                npy_dir=str(frame_npy_dir),
-                out_npz=str(tri_out),
-                normalized=config.normalized,
-                pixel=config.pixel,
-                invert_extrinsics=config.invert_extrinsics,
-                lm_iters=config.lm_iters,
-                lm_lambda=config.lm_lambda,
-                lm_eps=config.lm_eps,
-                debug=config.debug_triangulation,
-                debug_dir=str(tri_debug_dir) if tri_debug_dir else None,
-                img_dir=str(img_dir),
-                score_type=config.score_type,
-                huber_delta=config.huber_delta,
-                inlier_thresh=config.inlier_thresh,
-                robust_lm=config.robust_lm,
-                robust_lm_delta=config.robust_lm_delta,
-            )
-            run_triangulation(tri_cfg)
+            if tri_out.exists() and not config.overwrite:
+                print(f"[PIPELINE] Reusing triangulation: {tri_out}")
+            else:
+                tri_cfg = TriangulationConfig(
+                    mhr_py=config.mhr_py,
+                    caliscope_toml=config.caliscope_toml,
+                    cams=list(config.cams),
+                    toml_sections=config.toml_sections,
+                    npy_dir=str(frame_npy_dir),
+                    out_npz=str(tri_out),
+                    normalized=config.normalized,
+                    pixel=config.pixel,
+                    invert_extrinsics=config.invert_extrinsics,
+                    lm_iters=config.lm_iters,
+                    lm_lambda=config.lm_lambda,
+                    lm_eps=config.lm_eps,
+                    debug=config.debug_triangulation,
+                    debug_dir=str(tri_debug_dir) if tri_debug_dir else None,
+                    img_dir=str(img_dir),
+                    score_type=config.score_type,
+                    huber_delta=config.huber_delta,
+                    inlier_thresh=config.inlier_thresh,
+                    robust_lm=config.robust_lm,
+                    robust_lm_delta=config.robust_lm_delta,
+                )
+                run_triangulation(tri_cfg)
         elif not tri_out.exists():
             raise FileNotFoundError(f"Missing triangulation output while --skip_triangulation: {tri_out}")
 
         optimized_npy: Optional[Path] = None
         if not config.skip_optimization:
             optimized_npy = (optimization_root / rel_dir / config.optimized_name).resolve()
-            opt_cfg = OptimizationConfig(
-                npz=tri_out,
-                npy_dir=frame_npy_dir,
-                cams=list(config.cams),
-                out_npy=optimized_npy,
-                debug_dir=(optimization_root / rel_dir / "debug_opt").resolve(),
-                hf_repo=config.hf_repo,
-                ckpt=opt_ckpt,
-                mhr_pt=opt_mhr_pt,
-                device=config.device,
-                iters=config.iters,
-                lr=config.lr,
-                with_scale=config.with_scale,
-                huber_m=config.huber_m,
-                w_pose_reg=config.w_pose_reg,
-                topk_print=config.topk_print,
-            )
-            run_optimization(opt_cfg)
+            if optimized_npy.exists() and not config.overwrite:
+                print(f"[PIPELINE] Reusing optimized output: {optimized_npy}")
+            else:
+                opt_cfg = OptimizationConfig(
+                    npz=tri_out,
+                    npy_dir=frame_npy_dir,
+                    cams=list(config.cams),
+                    out_npy=optimized_npy,
+                    debug_dir=(optimization_root / rel_dir / "debug_opt").resolve(),
+                    hf_repo=config.hf_repo,
+                    ckpt=opt_ckpt,
+                    mhr_pt=opt_mhr_pt,
+                    device=config.device,
+                    iters=config.iters,
+                    lr=config.lr,
+                    with_scale=config.with_scale,
+                    huber_m=config.huber_m,
+                    w_pose_reg=config.w_pose_reg,
+                    topk_print=config.topk_print,
+                    save_debug_artifacts=config.save_opt_debug,
+                )
+                run_optimization(opt_cfg, runtime=opt_runtime)
 
         frame_results.append(
             FramePipelineResult(
@@ -376,6 +456,8 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
 
 
 def main(args: Optional[argparse.Namespace] = None) -> FullPipelineResult:
+    """CLI/programmatic entrypoint for full pipeline execution."""
+
     if args is None:
         args = parse_args()
     config = namespace_to_config(args)

@@ -5,13 +5,6 @@ triangulate_mhr3d_gt.py
 Triangulate + per-point Bundle Adjustment (Levenberg–Marquardt) for an MHR-70 subset
 (hands + shoulders + elbows + wrists) from multiple views.
 
-✅ Keeps the SAME CLI inputs/flags as your working refactor.
-✅ Adds OPTIONAL args to robustify:
-   - Pair-hypothesis initialization (Step A)
-   - Robust scoring (Step B): median / trimmed / huber
-   - Inlier view selection before BA (Step C)
-   - (Optional) robust LM weighting (IRLS-ish) using Huber
-
 Input layout (ONE dir each):
   npy_dir/
     front.npy (or .npz)
@@ -80,6 +73,8 @@ NP_EXTS = [".npy", ".npz"]
 
 @dataclass
 class TriangulationConfig:
+    """Configuration for stage-2 triangulation + per-point bundle adjustment."""
+
     mhr_py: str
     caliscope_toml: str
     cams: List[str]
@@ -101,10 +96,13 @@ class TriangulationConfig:
     inlier_thresh: float = 30.0
     robust_lm: bool = False
     robust_lm_delta: float = 10.0
+    reseed_from_inliers: bool = True
 
 
 @dataclass
 class TriangulationRunResult:
+    """Outputs from stage-2 triangulation."""
+
     out_npz: Path
     points3d_init: np.ndarray
     points3d_refined: np.ndarray
@@ -524,6 +522,7 @@ class TriangulatorBA:
         # robust LM option
         robust_lm: bool,
         robust_lm_delta: float,
+        reseed_from_inliers: bool,
     ):
         self.cams = cams
         self.cameras = cameras
@@ -543,6 +542,7 @@ class TriangulatorBA:
 
         self.robust_lm = bool(robust_lm)
         self.robust_lm_delta = float(robust_lm_delta)
+        self.reseed_from_inliers = bool(reseed_from_inliers)
 
         self.M = int(subset.subset_indices.shape[0])
 
@@ -653,7 +653,6 @@ class TriangulatorBA:
                 best_X = self._triangulate_point_dlt(views)
                 best_pair = (-1, -1)
 
-            points3d_init[j] = best_X
             best_pair_idx[j] = np.array(best_pair, dtype=np.int32)
 
             # Step C: inlier selection based on X*
@@ -687,6 +686,23 @@ class TriangulatorBA:
                         if np.isfinite(obs_uv[vv]).all():
                             inlier_mask[j, vv] = True
 
+                # optional reseed: DLT from all selected inlier views
+                if self.reseed_from_inliers and inlier_mask[j].sum() >= 2:
+                    dlt_views = []
+                    for v in range(V):
+                        if not inlier_mask[j, v]:
+                            continue
+                        xy = self.und_per_cam[self.cams[v]][j]
+                        if not np.isfinite(xy).all():
+                            continue
+                        dlt_views.append((xy, self.cameras[self.cams[v]].P_norm))
+                    if len(dlt_views) >= 2:
+                        X_reseed = self._triangulate_point_dlt(dlt_views)
+                        if np.isfinite(X_reseed).all():
+                            best_X = X_reseed
+
+            points3d_init[j] = best_X
+
         return points3d_init, best_pair_idx, inlier_mask
 
     # ---------- refinement ----------
@@ -702,6 +718,8 @@ class TriangulatorBA:
             X0 = points3d_init[j]
             if not np.isfinite(X0).all():
                 continue
+            # preserve initialized estimate when refinement is not possible
+            points3d_ref[j] = X0
 
             inliers = inlier_mask[j]
             if inliers.sum() < 2:
@@ -709,6 +727,7 @@ class TriangulatorBA:
 
             obs_uvs: List[np.ndarray] = []
             cams_used: List[CameraModel] = []
+            dlt_views: List[Tuple[np.ndarray, np.ndarray]] = []
 
             for v in range(V):
                 if not inliers[v]:
@@ -719,12 +738,21 @@ class TriangulatorBA:
                     continue
                 obs_uvs.append(uv.astype(np.float64))
                 cams_used.append(self.cameras[cam_name])
+                und = self.und_per_cam[cam_name][j]
+                if np.isfinite(und).all():
+                    dlt_views.append((und.astype(np.float64), self.cameras[cam_name].P_norm))
 
             if len(obs_uvs) < 2:
                 continue
 
+            X_seed = X0
+            if self.reseed_from_inliers and len(dlt_views) >= 2:
+                X_seed_try = self._triangulate_point_dlt(dlt_views)
+                if np.isfinite(X_seed_try).all():
+                    X_seed = X_seed_try
+
             Xref = self._lm_refine_point(
-                X0=X0,
+                X0=X_seed,
                 obs_uvs=obs_uvs,
                 cams=cams_used,
                 max_iters=self.lm_iters,
@@ -733,7 +761,8 @@ class TriangulatorBA:
                 robust=self.robust_lm,
                 robust_delta=self.robust_lm_delta,
             )
-            points3d_ref[j] = Xref
+            if np.isfinite(Xref).all():
+                points3d_ref[j] = Xref
 
         return points3d_ref
 
@@ -995,6 +1024,8 @@ def draw_overlay(img_bgr: np.ndarray, obs: np.ndarray, proj: np.ndarray, edges: 
 # -----------------------------
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build CLI parser for standalone triangulation runs."""
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--mhr_py", required=True, help="Path to mhr_70.py (defines pose_info)")
     ap.add_argument("--caliscope_toml", required=True, help="Path to Caliscope config.toml")
@@ -1029,10 +1060,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="If set, use Huber-weighted residuals inside LM (robust BA)")
     ap.add_argument("--robust_lm_delta", type=float, default=10.0,
                     help="Delta for robust LM Huber weighting (pixels)")
+    ap.add_argument(
+        "--no_reseed_from_inliers",
+        action="store_true",
+        help="Disable DLT reseeding from selected inlier views before LM refinement.",
+    )
     return ap
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse CLI args for stage-2 triangulation."""
+
     parser = build_arg_parser()
     return parser.parse_args(argv)
 
@@ -1041,6 +1079,8 @@ def resolve_toml_sections(
     cams: List[str],
     toml_sections_arg: Optional[List[str]],
 ) -> List[str]:
+    """Resolve TOML camera section names aligned with logical `cams` order."""
+
     if toml_sections_arg is None or len(toml_sections_arg) == 0:
         return cams[:]
 
@@ -1050,6 +1090,8 @@ def resolve_toml_sections(
 
 
 def namespace_to_config(args: argparse.Namespace) -> TriangulationConfig:
+    """Convert parsed CLI args to `TriangulationConfig`."""
+
     return TriangulationConfig(
         mhr_py=args.mhr_py,
         caliscope_toml=args.caliscope_toml,
@@ -1072,10 +1114,20 @@ def namespace_to_config(args: argparse.Namespace) -> TriangulationConfig:
         inlier_thresh=args.inlier_thresh,
         robust_lm=args.robust_lm,
         robust_lm_delta=args.robust_lm_delta,
+        reseed_from_inliers=not args.no_reseed_from_inliers,
     )
 
 
 def run_triangulation(config: TriangulationConfig) -> TriangulationRunResult:
+    """Execute stage-2 triangulation and persist a `.npz` bundle.
+
+    Core idea:
+    1. Load per-camera 2D keypoints and select the target MHR subset.
+    2. Generate robust pairwise triangulation hypotheses.
+    3. Gate inlier views and run per-point LM refinement.
+    4. Save refined 3D points, reprojections, and diagnostics to disk.
+    """
+
     cams = list(config.cams)
     if len(cams) < 2:
         raise ValueError("Need at least 2 cameras for triangulation/BA.")
@@ -1124,6 +1176,7 @@ def run_triangulation(config: TriangulationConfig) -> TriangulationRunResult:
         inlier_thresh=config.inlier_thresh,
         robust_lm=config.robust_lm,
         robust_lm_delta=config.robust_lm_delta,
+        reseed_from_inliers=config.reseed_from_inliers,
     )
     pipe.load_observations()
 
@@ -1217,6 +1270,8 @@ def run_triangulation(config: TriangulationConfig) -> TriangulationRunResult:
 
 
 def main(args: Optional[argparse.Namespace] = None) -> TriangulationRunResult:
+    """CLI/programmatic entrypoint for stage-2 triangulation."""
+
     if args is None:
         args = parse_args()
     config = namespace_to_config(args)
