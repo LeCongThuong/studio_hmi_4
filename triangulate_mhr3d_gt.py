@@ -151,7 +151,15 @@ def load_pred_keypoints_2d(file_path: Path, index: int) -> np.ndarray:
 
     if suffix == ".npy":
         obj = np.load(str(file_path), allow_pickle=True)
-        data = obj.item() if hasattr(obj, "item") else obj
+        if isinstance(obj, np.ndarray):
+            if obj.dtype == object and obj.shape == () and hasattr(obj, "item"):
+                data = obj.item()
+            else:
+                data = {"pred_keypoints_2d": obj}
+        elif isinstance(obj, dict):
+            data = obj
+        else:
+            raise ValueError(f"Unsupported .npy payload type at {file_path}: {type(obj)}")
     elif suffix == ".npz":
         npz = np.load(str(file_path), allow_pickle=True)
         if "pred_keypoints_2d" in npz:

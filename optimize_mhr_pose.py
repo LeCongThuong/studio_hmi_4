@@ -50,6 +50,39 @@ DEFAULT_PARAM_DIMS = {
     "expr_params": 72,
 }
 
+# Source for hand indices: upstream sam-3d-body `mhr_utils.py` (`mhr_param_hand_idxs`).
+MHR_PARAM_HAND_IDXS_133 = np.array(
+    [
+        62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+        80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97,
+        98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+        112, 113, 114, 115,
+    ],
+    dtype=np.int64,
+)
+
+# Source for lower-body semantics: local `mhr70.py` lower keypoint groups + one-time
+# audit of MHR body parameter layout from upstream `mhr_utils.py`/`mhr_head.py`.
+LOWER_BODY_POSE_IDXS_BY_DIM = {
+    # 133D body pose params:
+    # - 0..30 cover pelvis/leg chains in this parameterization.
+    # - 124..129 are translational DoFs and are frozen to suppress standing jitter.
+    133: np.array(list(range(0, 31)) + [124, 125, 126, 127, 128, 129], dtype=np.int64),
+    # 204D full MHR model params:
+    # - first 6 are rigid global params
+    # - body pose block starts at +6 offset from the 133D pose indexing
+    204: np.array(
+        sorted(
+            set(
+                list(range(0, 6))
+                + [6 + i for i in range(0, 31)]
+                + [6 + i for i in [124, 125, 126, 127, 128, 129]]
+            )
+        ),
+        dtype=np.int64,
+    ),
+}
+
 
 @dataclass
 class OptimizationConfig:
@@ -86,6 +119,9 @@ class OptimizationConfig:
     bad_data_loss_threshold: float = 2e-5
     bad_loss_growth_ratio: float = 1.5
     loss_divergence_ratio: float = 3.0
+    min_valid_points: int = 6
+    zero_weight_strategy: str = "uniform_finite"
+    freeze_lower_body: bool = False
 
 
 @dataclass
@@ -207,6 +243,135 @@ def get_param_array(d: dict, key: str, device: torch.device) -> torch.Tensor:
 
     dim = DEFAULT_PARAM_DIMS[key]
     return to_torch(np.zeros(dim, np.float32), device).flatten()
+
+
+def resolve_lower_body_pose_indices(pose_dim: int) -> np.ndarray:
+    idxs = LOWER_BODY_POSE_IDXS_BY_DIM.get(int(pose_dim))
+    if idxs is None:
+        raise RuntimeError(
+            f"freeze_lower_body enabled but no hardcoded lower-body index table for pose_dim={pose_dim}"
+        )
+    idxs = np.asarray(idxs, dtype=np.int64).reshape(-1)
+    idxs = idxs[(idxs >= 0) & (idxs < int(pose_dim))]
+    return np.unique(idxs)
+
+
+def _build_base_keep_mask(
+    pose_dim: int,
+    hand_mask_133: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    mask = torch.ones(int(pose_dim), device=device, dtype=torch.float32)
+    pose_dim = int(pose_dim)
+    hand_mask_133 = hand_mask_133.to(device=device, dtype=torch.bool)
+
+    if pose_dim == int(hand_mask_133.numel()):
+        mask[hand_mask_133] = 0.0
+        if pose_dim >= 3:
+            mask[-3:] = 0.0
+        return mask
+
+    if pose_dim == 204:
+        mapped = 6 + MHR_PARAM_HAND_IDXS_133[MHR_PARAM_HAND_IDXS_133 < 130]
+        mapped = mapped[(mapped >= 0) & (mapped < pose_dim)]
+        if mapped.size > 0:
+            mapped_t = torch.from_numpy(mapped).to(device=device, dtype=torch.long)
+            mask[mapped_t] = 0.0
+        return mask
+
+    copy_len = min(pose_dim, int(hand_mask_133.numel()))
+    if copy_len > 0:
+        hand_idx = torch.nonzero(hand_mask_133[:copy_len], as_tuple=False).flatten()
+        if hand_idx.numel() > 0:
+            mask[hand_idx] = 0.0
+    if pose_dim >= 3:
+        mask[-3:] = 0.0
+    return mask
+
+
+def _sanitize_subset_and_weights(
+    gtM: np.ndarray,
+    wM: np.ndarray,
+    min_valid_points: int,
+    strategy: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    gt = np.asarray(gtM, dtype=np.float32)
+    if gt.ndim != 2 or gt.shape[1] != 3:
+        raise ValueError(f"Expected gtM shape (M,3), got {gt.shape}")
+    w = np.asarray(wM, dtype=np.float32).reshape(-1)
+    if w.shape[0] != gt.shape[0]:
+        raise ValueError(
+            f"Weight count does not match gt points: {w.shape[0]} vs {gt.shape[0]}"
+        )
+
+    finite = np.isfinite(gt).all(axis=1)
+    w[~np.isfinite(w)] = 0.0
+    w[~finite] = 0.0
+    w = np.clip(w, 0.0, 1.0)
+
+    min_pts = max(3, int(min_valid_points))
+    nonzero = (w > 1e-8) & finite
+    if int(nonzero.sum()) < min_pts:
+        if strategy == "uniform_finite":
+            w = np.where(finite, 1.0, 0.0).astype(np.float32)
+            nonzero = finite.copy()
+        elif strategy == "fail":
+            raise RuntimeError(
+                f"Insufficient valid weighted points: {int(nonzero.sum())} < {min_pts}"
+            )
+        else:
+            raise ValueError(
+                f"Unsupported zero_weight_strategy='{strategy}'. "
+                "Expected one of: uniform_finite, fail."
+            )
+
+    if int(nonzero.sum()) < min_pts:
+        raise RuntimeError(
+            f"Insufficient finite points after fallback: {int(nonzero.sum())} < {min_pts}"
+        )
+    return finite, w, nonzero
+
+
+def _resolve_valid_indices_for_prediction(
+    predM: torch.Tensor,
+    finite_gt_mask_t: torch.Tensor,
+    base_wM_t: torch.Tensor,
+    min_valid_points: int,
+    strategy: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pred_finite_t = torch.isfinite(predM).all(dim=1)
+    finite_pred_gt_t = finite_gt_mask_t & pred_finite_t
+    w_masked = torch.where(finite_pred_gt_t, base_wM_t, torch.zeros_like(base_wM_t))
+    valid_t = finite_pred_gt_t & (w_masked > 1e-8)
+    min_pts = max(3, int(min_valid_points))
+
+    if int(valid_t.sum().item()) < min_pts:
+        if strategy == "uniform_finite":
+            w_masked = torch.where(
+                finite_pred_gt_t,
+                torch.ones_like(base_wM_t),
+                torch.zeros_like(base_wM_t),
+            )
+            valid_t = finite_pred_gt_t
+        elif strategy == "fail":
+            raise RuntimeError(
+                f"Insufficient valid weighted points after pred finite mask: "
+                f"{int(valid_t.sum().item())} < {min_pts}"
+            )
+        else:
+            raise ValueError(
+                f"Unsupported zero_weight_strategy='{strategy}'. "
+                "Expected one of: uniform_finite, fail."
+            )
+
+    if int(valid_t.sum().item()) < min_pts:
+        raise RuntimeError(
+            "Insufficient valid points after applying prediction finite mask and "
+            f"fallback: {int(valid_t.sum().item())} < {min_pts}"
+        )
+
+    idx_t = torch.nonzero(valid_t, as_tuple=False).flatten()
+    return idx_t, w_masked
 
 
 def safe_growth(final_value: float, best_value: float) -> float:
@@ -448,6 +613,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--bad_data_loss_threshold", type=float, default=2e-5, help="Mark result bad when best data loss exceeds this value.")
     ap.add_argument("--bad_loss_growth_ratio", type=float, default=1.5, help="Mark result bad when final_loss / best_loss exceeds this ratio.")
     ap.add_argument("--loss_divergence_ratio", type=float, default=3.0, help="Early break when current loss diverges above best_loss by this ratio.")
+    ap.add_argument("--min_valid_points", type=int, default=6, help="Minimum valid points required for Umeyama/loss computations.")
+    ap.add_argument(
+        "--zero_weight_strategy",
+        type=str,
+        choices=["uniform_finite", "fail"],
+        default="uniform_finite",
+        help="Behavior when inlier weights collapse to ~zero on valid points.",
+    )
+    ap.add_argument(
+        "--freeze_lower_body",
+        action="store_true",
+        help="Freeze lower-body pose dimensions to initialization (reduces stationary-leg jitter).",
+    )
     return ap
 
 
@@ -491,6 +669,9 @@ def namespace_to_config(args: argparse.Namespace) -> OptimizationConfig:
         bad_data_loss_threshold=args.bad_data_loss_threshold,
         bad_loss_growth_ratio=args.bad_loss_growth_ratio,
         loss_divergence_ratio=args.loss_divergence_ratio,
+        min_valid_points=args.min_valid_points,
+        zero_weight_strategy=args.zero_weight_strategy,
+        freeze_lower_body=args.freeze_lower_body,
     )
 
 
@@ -515,7 +696,7 @@ def run_optimization(
     device = runtime.device
     head = runtime.head
     hand_mask = runtime.hand_mask
-    keep_mask = runtime.keep_mask
+    runtime_keep_mask = runtime.keep_mask
 
     debug_dir = config.debug_dir.expanduser().resolve()
     if config.save_debug_artifacts:
@@ -543,8 +724,15 @@ def run_optimization(
     else:
         wM = np.ones((M,), dtype=np.float32)
 
+    finite_gt_mask_np, wM_np, _ = _sanitize_subset_and_weights(
+        gtM=gtM,
+        wM=wM,
+        min_valid_points=config.min_valid_points,
+        strategy=config.zero_weight_strategy,
+    )
+    finite_gt_mask_t = torch.from_numpy(finite_gt_mask_np).to(device=device, dtype=torch.bool)
     gtM_t = to_torch(gtM, device)
-    wM_t = to_torch(wM, device)
+    wM_t = to_torch(wM_np, device)
 
     # ---- Load per-view SAM outputs and score them ----
     view_scores_3d = {}
@@ -568,8 +756,12 @@ def run_optimization(
         shape45 = get_param_array(d, "shape_params", device)
         expr72 = get_param_array(d, "expr_params", device)
 
-        # mask (NO in-place on leaf; this one isn't leaf anyway but keep consistent)
-        pose_eff = pose133 * keep_mask
+        view_keep_mask = _build_base_keep_mask(
+            pose_dim=int(pose133.numel()),
+            hand_mask_133=hand_mask,
+            device=device,
+        )
+        pose_eff = pose133 * view_keep_mask
 
         out = mhr_fk(head, pose_eff, hand108, scale28, shape45, expr72, device,
                      want_verts=False, want_joint=False, want_model_params=False)
@@ -577,11 +769,28 @@ def run_optimization(
         k70 = apply_repo_camera_flip_xyz(keypoints_308[:70])
 
         predM = k70[subset_idx]  # (M,3)
+        try:
+            valid_idx_t, wM_view_t = _resolve_valid_indices_for_prediction(
+                predM=predM,
+                finite_gt_mask_t=finite_gt_mask_t,
+                base_wM_t=wM_t,
+                min_valid_points=config.min_valid_points,
+                strategy=config.zero_weight_strategy,
+            )
+        except RuntimeError:
+            view_scores_3d[cam] = float("inf")
+            view_align[cam] = (1.0, np.eye(3, dtype=np.float32), np.zeros(3, dtype=np.float32))
+            print(f"[score] {cam:>8s}: 3D=inf m   mean_px={view_mean_px[cam]:.3f}   file={npy_path.name}")
+            continue
 
-        s, R, t = umeyama_similarity(predM, gtM_t, w=wM_t, with_scale=config.with_scale)
-        predM_aligned = s * (predM @ R.T) + t[None, :]
-        r = torch.sqrt(((predM_aligned - gtM_t) ** 2).sum(dim=1) + 1e-12)
-        score = (wM_t * r).sum() / (wM_t.sum() + 1e-9)
+        predM_v = predM.index_select(0, valid_idx_t)
+        gtM_v = gtM_t.index_select(0, valid_idx_t)
+        wM_v = wM_view_t.index_select(0, valid_idx_t)
+
+        s, R, t = umeyama_similarity(predM_v, gtM_v, w=wM_v, with_scale=config.with_scale)
+        predM_aligned_v = s * (predM_v @ R.T) + t[None, :]
+        r = torch.sqrt(((predM_aligned_v - gtM_v) ** 2).sum(dim=1) + 1e-12)
+        score = (wM_v * r).sum() / (wM_v.sum() + 1e-9)
 
         view_scores_3d[cam] = float(score.detach().cpu().item())
         view_align[cam] = (float(s.cpu().item()), R.cpu().numpy(), t.cpu().numpy())
@@ -599,8 +808,24 @@ def run_optimization(
     init_shape = get_param_array(init_dict, "shape_params", device)
     init_expr = get_param_array(init_dict, "expr_params", device)
 
-    # Mask init pose (no in-place leaf issue here)
-    init_pose = init_pose * keep_mask
+    pose_dim = int(init_pose.numel())
+    if int(runtime_keep_mask.numel()) == pose_dim:
+        base_keep_mask = runtime_keep_mask.to(device=device, dtype=torch.float32)
+    else:
+        base_keep_mask = _build_base_keep_mask(
+            pose_dim=pose_dim,
+            hand_mask_133=hand_mask,
+            device=device,
+        )
+
+    optimize_mask = base_keep_mask.clone()
+    if config.freeze_lower_body:
+        lower_idxs_np = resolve_lower_body_pose_indices(pose_dim=pose_dim)
+        if lower_idxs_np.size > 0:
+            lower_idxs_t = torch.from_numpy(lower_idxs_np).to(device=device, dtype=torch.long)
+            optimize_mask[lower_idxs_t] = 0.0
+
+    init_pose = init_pose * optimize_mask
     temporal_prev_np = config.init_prev_body_pose
     if temporal_prev_np is None:
         # Backward-compatibility for existing callers.
@@ -613,11 +838,11 @@ def run_optimization(
     used_temporal_init = temporal_prev_np is not None
     if temporal_prev_np is not None:
         temporal_pose = to_torch(temporal_prev_np, device).flatten().to(torch.float32)
-        temporal_pose = temporal_pose * keep_mask
+        temporal_pose = temporal_pose * optimize_mask
         init_target = temporal_pose
         if temporal_prev_prev_np is not None:
             temporal_prev_prev_pose = to_torch(temporal_prev_prev_np, device).flatten().to(torch.float32)
-            temporal_prev_prev_pose = temporal_prev_prev_pose * keep_mask
+            temporal_prev_prev_pose = temporal_prev_prev_pose * optimize_mask
             extrap = float(np.clip(config.temporal_extrapolation, 0.0, 2.0))
             temporal_velocity_target = temporal_pose + extrap * (temporal_pose - temporal_prev_prev_pose)
             init_target = temporal_velocity_target
@@ -634,15 +859,25 @@ def run_optimization(
     # debug init plot
     if config.save_debug_artifacts:
         with torch.no_grad():
-            pose_eff0 = pose.detach() * keep_mask
+            pose_eff0 = pose.detach() * optimize_mask + init_pose * (1.0 - optimize_mask)
             out0 = mhr_fk(head, pose_eff0, init_hand, init_scale, init_shape, init_expr, device,
                           want_verts=False, want_joint=False, want_model_params=False)
             k70_0 = apply_repo_camera_flip_xyz(out0[1].squeeze(0)[:70])
             predM0 = k70_0[subset_idx]
-            s0, R0, t0 = umeyama_similarity(predM0, gtM_t, w=wM_t, with_scale=config.with_scale)
-            predM0_al = s0 * (predM0 @ R0.T) + t0[None, :]
+            valid_idx0_t, wM0_t = _resolve_valid_indices_for_prediction(
+                predM=predM0,
+                finite_gt_mask_t=finite_gt_mask_t,
+                base_wM_t=wM_t,
+                min_valid_points=config.min_valid_points,
+                strategy=config.zero_weight_strategy,
+            )
+            predM0_v = predM0.index_select(0, valid_idx0_t)
+            gtM0_v = gtM_t.index_select(0, valid_idx0_t)
+            wM0_v = wM0_t.index_select(0, valid_idx0_t)
+            s0, R0, t0 = umeyama_similarity(predM0_v, gtM0_v, w=wM0_v, with_scale=config.with_scale)
+            predM0_al = s0 * (predM0_v @ R0.T) + t0[None, :]
             plot_3d_compare(
-                gtM,
+                gtM[valid_idx0_t.cpu().numpy()],
                 predM0_al.cpu().numpy(),
                 f"Init ({best_cam}) aligned to GT (M={M})",
                 debug_dir / "compare_init_subset.png",
@@ -661,22 +896,33 @@ def run_optimization(
     for it in range(config.iters):
         opt.zero_grad(set_to_none=True)
 
-        # effective pose used in FK (NO in-place on pose)
-        pose_eff = pose * keep_mask
+        pose_eff = pose * optimize_mask + init_pose * (1.0 - optimize_mask)
 
         out = mhr_fk(head, pose_eff, init_hand, init_scale, init_shape, init_expr, device,
                      want_verts=False, want_joint=False, want_model_params=False)
         k70 = apply_repo_camera_flip_xyz(out[1].squeeze(0)[:70])
         predM = k70[subset_idx]
 
-        with torch.no_grad():
-            s, R, t = umeyama_similarity(predM.detach(), gtM_t, w=wM_t, with_scale=config.with_scale)
+        valid_idx_t, wM_masked_t = _resolve_valid_indices_for_prediction(
+            predM=predM,
+            finite_gt_mask_t=finite_gt_mask_t,
+            base_wM_t=wM_t,
+            min_valid_points=config.min_valid_points,
+            strategy=config.zero_weight_strategy,
+        )
 
-        predM_aligned = s * (predM @ R.T) + t[None, :]
-        diff = predM_aligned - gtM_t
+        predM_v = predM.index_select(0, valid_idx_t)
+        gtM_v = gtM_t.index_select(0, valid_idx_t)
+        wM_v = wM_masked_t.index_select(0, valid_idx_t)
+
+        with torch.no_grad():
+            s, R, t = umeyama_similarity(predM_v.detach(), gtM_v, w=wM_v, with_scale=config.with_scale)
+
+        predM_aligned = s * (predM_v @ R.T) + t[None, :]
+        diff = predM_aligned - gtM_v
         r = torch.sqrt((diff * diff).sum(dim=1) + 1e-12)
 
-        loss_data = (wM_t * huber(r, delta=config.huber_m)).sum() / (wM_t.sum() + 1e-9)
+        loss_data = (wM_v * huber(r, delta=config.huber_m)).sum() / (wM_v.sum() + 1e-9)
         loss_reg = config.w_pose_reg * torch.mean((pose - init_pose) ** 2)
         if temporal_pose is not None and config.w_temporal > 0:
             loss_temporal = config.w_temporal * torch.mean((pose - temporal_pose) ** 2)
@@ -700,18 +946,15 @@ def run_optimization(
 
         loss.backward()
 
-        # zero grads on frozen dims (important)
         with torch.no_grad():
             if pose.grad is not None:
-                pose.grad[hand_mask] = 0.0
-                pose.grad[-3:] = 0.0
+                pose.grad[optimize_mask == 0] = 0.0
 
         torch.nn.utils.clip_grad_norm_([pose], 1.0)
         opt.step()
 
-        # pin values (optional but keeps optimizer state sane)
         with torch.no_grad():
-            pose.mul_(keep_mask)
+            pose.copy_(pose * optimize_mask + init_pose * (1.0 - optimize_mask))
 
         loss_hist.append(float(loss.detach().cpu().item()))
         data_loss_hist.append(float(loss_data.detach().cpu().item()))
@@ -750,14 +993,14 @@ def run_optimization(
     if best_iter >= 0:
         with torch.no_grad():
             pose.copy_(best_pose)
-            pose.mul_(keep_mask)
+            pose.copy_(pose * optimize_mask + init_pose * (1.0 - optimize_mask))
 
     if config.save_debug_artifacts:
         plot_loss_curve(loss_hist, debug_dir / "loss_curve.png")
 
     # final forward (full outputs)
     with torch.no_grad():
-        pose_eff = pose.detach() * keep_mask
+        pose_eff = pose.detach() * optimize_mask + init_pose * (1.0 - optimize_mask)
         outF = mhr_fk(head, pose_eff, init_hand, init_scale, init_shape, init_expr, device,
                       want_verts=True, want_joint=True, want_model_params=True)
 
@@ -770,30 +1013,79 @@ def run_optimization(
 
         k70 = apply_repo_camera_flip_xyz(keypoints_308[:70])
         predM = k70[subset_idx]
-        s, R, t = umeyama_similarity(predM, gtM_t, w=wM_t, with_scale=config.with_scale)
+
+        valid_idx_t, wM_masked_t = _resolve_valid_indices_for_prediction(
+            predM=predM,
+            finite_gt_mask_t=finite_gt_mask_t,
+            base_wM_t=wM_t,
+            min_valid_points=config.min_valid_points,
+            strategy=config.zero_weight_strategy,
+        )
+        predM_v = predM.index_select(0, valid_idx_t)
+        gtM_v = gtM_t.index_select(0, valid_idx_t)
+        wM_v = wM_masked_t.index_select(0, valid_idx_t)
+
+        s, R, t = umeyama_similarity(predM_v, gtM_v, w=wM_v, with_scale=config.with_scale)
 
         k70_aligned = s * (k70 @ R.T) + t[None, :]
         verts_aligned = s * (verts @ R.T) + t[None, :]
         jcoords_aligned = s * (jcoords @ R.T) + t[None, :]
         jrots_aligned = R[None, :, :] @ jrots  # optional consistency
 
-        residual_subset = torch.sqrt(((k70_aligned[subset_idx] - gtM_t) ** 2).sum(dim=1) + 1e-12)
-        aligned_data_loss = (wM_t * huber(residual_subset, delta=config.huber_m)).sum() / (wM_t.sum() + 1e-9)
+        predM_aligned_v = s * (predM_v @ R.T) + t[None, :]
+        residual_subset = torch.sqrt(((predM_aligned_v - gtM_v) ** 2).sum(dim=1) + 1e-12)
+        aligned_data_loss = (wM_v * huber(residual_subset, delta=config.huber_m)).sum() / (wM_v.sum() + 1e-9)
         final_data_loss = float(aligned_data_loss.detach().cpu().item())
         best_data_loss = min(best_data_loss, final_data_loss)
+        final_reg_loss = float((config.w_pose_reg * torch.mean((pose - init_pose) ** 2)).detach().cpu().item())
+        if temporal_pose is not None and config.w_temporal > 0:
+            final_temporal = float(
+                (config.w_temporal * torch.mean((pose - temporal_pose) ** 2)).detach().cpu().item()
+            )
+        else:
+            final_temporal = 0.0
+        if temporal_velocity_target is not None and config.w_temporal_velocity > 0:
+            final_temporal_velocity = float(
+                (config.w_temporal_velocity * torch.mean((pose - temporal_velocity_target) ** 2))
+                .detach()
+                .cpu()
+                .item()
+            )
+        else:
+            final_temporal_velocity = 0.0
+        if (
+            temporal_pose is not None
+            and temporal_prev_prev_pose is not None
+            and config.w_temporal_accel > 0
+        ):
+            prev_vel = temporal_pose - temporal_prev_prev_pose
+            cur_vel = pose - temporal_pose
+            final_temporal_accel = float(
+                (config.w_temporal_accel * torch.mean((cur_vel - prev_vel) ** 2)).detach().cpu().item()
+            )
+        else:
+            final_temporal_accel = 0.0
+        final_loss = (
+            final_data_loss
+            + final_reg_loss
+            + final_temporal
+            + final_temporal_velocity
+            + final_temporal_accel
+        )
 
         rM = residual_subset.cpu().numpy()
         worst = np.argsort(-rM)[: config.topk_print]
         print("\nTop residual points (subset indices):")
         for idx in worst:
-            name = str(subset_names[idx]) if subset_names is not None else f"pt{idx}"
+            subset_pos = int(valid_idx_t[idx].item())
+            name = str(subset_names[subset_pos]) if subset_names is not None else f"pt{subset_pos}"
             print(f"  {idx:02d} ({name}): {rM[idx]:.4f} m")
 
         if config.save_debug_artifacts:
             plot_3d_compare(
-                gtM,
-                k70_aligned[subset_idx].cpu().numpy(),
-                f"Optimized aligned to GT (M={M})",
+                gtM[valid_idx_t.cpu().numpy()],
+                predM_aligned_v.cpu().numpy(),
+                f"Optimized aligned to GT (M={int(valid_idx_t.numel())})",
                 debug_dir / "compare_opt_subset.png",
             )
 
@@ -809,7 +1101,7 @@ def run_optimization(
                 cams=np.array(cams, dtype=object),
                 subset_idx=subset_idx,
                 gt_subset=gtM,
-                w_subset=wM,
+                w_subset=wM_np,
                 init_scores_3d_m=np.array([view_scores_3d[c] for c in cams], dtype=np.float32),
                 init_scores_mean_px=np.array([view_mean_px[c] for c in cams], dtype=np.float32),
                 final_scale=np.array(float(s.cpu().item()), dtype=np.float32),
@@ -823,7 +1115,7 @@ def run_optimization(
                 final_data_loss=np.array(final_data_loss, dtype=np.float32),
                 best_iter=np.array(best_iter, dtype=np.int32),
                 residual_subset_m=np.array(rM, dtype=np.float32),
-                keep_mask=keep_mask.cpu().numpy(),
+                keep_mask=optimize_mask.cpu().numpy(),
             )
 
         # output npy dict in same style as SAM output
@@ -901,7 +1193,7 @@ def run_optimization(
         best_iter=int(best_iter),
         used_temporal_init=bool(used_temporal_init),
         is_bad_loss=is_bad_loss,
-        best_pose=(pose.detach() * keep_mask).cpu().numpy().astype(np.float32),
+        best_pose=(pose.detach() * optimize_mask + init_pose * (1.0 - optimize_mask)).cpu().numpy().astype(np.float32),
     )
 
 

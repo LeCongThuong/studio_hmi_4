@@ -67,6 +67,8 @@ class FullPipelineConfig:
     use_mask: bool = False
     debug_inference: bool = False
     save_mhr_params: bool = False
+    person_select_strategy: str = "largest_bbox"
+    person_index: int = 0
     frame_rel: Optional[str] = None
     skip_inference: bool = False
     skip_triangulation: bool = False
@@ -106,6 +108,9 @@ class FullPipelineConfig:
     bad_loss_threshold: float = 3e-5
     bad_data_loss_threshold: float = 2e-5
     bad_loss_growth_ratio: float = 1.5
+    min_valid_points: int = 6
+    zero_weight_strategy: str = "uniform_finite"
+    freeze_lower_body: bool = False
     topk_print: int = 10
     save_opt_debug: bool = False
     bad_frame_max_retries: int = 2
@@ -183,12 +188,12 @@ def _parse_frame_index(rel_dir: str) -> Optional[int]:
 
 def _frame_sort_key(rel_dir: str):
     if rel_dir == "":
-        return [(0, -1)]
+        return [(0, "")]
     toks = rel_dir.replace("\\", "/").split("/")
     out = []
     for t in toks:
         if t.isdigit():
-            out.append((0, int(t)))
+            out.append((0, f"{int(t):020d}"))
         else:
             out.append((1, t))
     return out
@@ -279,6 +284,51 @@ def _cam_to_section_map(cams: Sequence[str], toml_sections: Optional[Sequence[st
     return {c: s for c, s in zip(cams, toml_sections)}
 
 
+def _expected_stage1_meta(config: FullPipelineConfig, image_root: Path) -> Dict[str, Any]:
+    include_rel_dirs = [config.frame_rel] if config.frame_rel else None
+    return {
+        "image_folder": str(image_root.resolve()),
+        "include_rel_dirs": include_rel_dirs,
+        "checkpoint_path": str(config.checkpoint_path),
+        "detector_name": str(config.detector_name),
+        "segmentor_name": str(config.segmentor_name),
+        "fov_name": str(config.fov_name),
+        "person_select_strategy": str(config.person_select_strategy),
+        "person_index": int(config.person_index),
+    }
+
+
+def _load_stage1_meta(meta_path: Path) -> Optional[Dict[str, Any]]:
+    if not meta_path.is_file():
+        return None
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _stage1_meta_matches(
+    existing_meta: Optional[Dict[str, Any]],
+    expected_meta: Dict[str, Any],
+) -> bool:
+    if existing_meta is None:
+        return False
+    keys = [
+        "image_folder",
+        "include_rel_dirs",
+        "checkpoint_path",
+        "detector_name",
+        "segmentor_name",
+        "fov_name",
+        "person_select_strategy",
+        "person_index",
+    ]
+    for key in keys:
+        if existing_meta.get(key) != expected_meta.get(key):
+            return False
+    return True
+
+
 def _update_result_from_opt(dst: FramePipelineResult, opt_res: OptimizationRunResult) -> None:
     dst.best_loss = float(opt_res.best_loss)
     dst.final_loss = float(opt_res.final_loss)
@@ -359,16 +409,28 @@ def _recover_missing_and_bad_frames(
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         if prev_i is not None and next_i is not None and next_i > prev_i:
+            prev_dict = frame_dicts[prev_i]
+            next_dict = frame_dicts[next_i]
+            if prev_dict is None or next_dict is None:
+                continue
             alpha = float((i - prev_i) / float(next_i - prev_i))
-            recovered = interpolate_frame_dict(frame_dicts[prev_i], frame_dicts[next_i], alpha)
+            recovered = interpolate_frame_dict(prev_dict, next_dict, alpha)
             fr.status = "recovered_interpolated"
             fr.recovered_from = f"{frame_results[prev_i].rel_dir}->{frame_results[next_i].rel_dir}"
         elif prev_i is not None:
-            recovered = copy_frame_dict(frame_dicts[prev_i], mode="copy_prev")
+            prev_dict = frame_dicts[prev_i]
+            if prev_dict is None:
+                continue
+            recovered = copy_frame_dict(prev_dict, mode="copy_prev")
             fr.status = "recovered_copy_prev"
             fr.recovered_from = frame_results[prev_i].rel_dir
         else:
-            recovered = copy_frame_dict(frame_dicts[next_i], mode="copy_next")
+            if next_i is None:
+                continue
+            next_dict = frame_dicts[next_i]
+            if next_dict is None:
+                continue
+            recovered = copy_frame_dict(next_dict, mode="copy_next")
             fr.status = "recovered_copy_next"
             fr.recovered_from = frame_results[next_i].rel_dir
 
@@ -459,6 +521,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--use_mask", action="store_true", default=False)
     ap.add_argument("--debug_inference", action="store_true", default=False)
     ap.add_argument("--save_mhr_params", action="store_true", default=False)
+    ap.add_argument(
+        "--person_select_strategy",
+        type=str,
+        default="largest_bbox",
+        choices=["first", "largest_bbox", "person_index"],
+        help="How stage-1 selects one person if multiple are detected.",
+    )
+    ap.add_argument(
+        "--person_index",
+        type=int,
+        default=0,
+        help="Person index used when --person_select_strategy=person_index.",
+    )
 
     # Pipeline control
     ap.add_argument("--frame_rel", default=None, type=str, help="Optional relative frame dir under npy root.")
@@ -513,6 +588,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--bad_loss_threshold", type=float, default=3e-5)
     ap.add_argument("--bad_data_loss_threshold", type=float, default=2e-5)
     ap.add_argument("--bad_loss_growth_ratio", type=float, default=1.5)
+    ap.add_argument("--min_valid_points", type=int, default=6)
+    ap.add_argument(
+        "--zero_weight_strategy",
+        type=str,
+        choices=["uniform_finite", "fail"],
+        default="uniform_finite",
+    )
+    ap.add_argument(
+        "--freeze_lower_body",
+        action="store_true",
+        help="Freeze lower-body pose dimensions in stage-3 optimization.",
+    )
     ap.add_argument("--bad_frame_max_retries", type=int, default=2)
     ap.add_argument("--topk_print", type=int, default=10)
     ap.add_argument("--save_opt_debug", action="store_true", default=False, help="Save optimization debug plots/artifacts.")
@@ -562,6 +649,8 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
             "Missing required args for namespace_to_config: "
             + ", ".join(missing_required)
         )
+    if not isinstance(cams, (list, tuple)):
+        raise AttributeError("Argument --cams must be a sequence of camera names.")
 
     debug_sequence = bool(
         getattr(args, "debug_sequence", False) or getattr(args, "debug_4d", False)
@@ -589,6 +678,8 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
         use_mask=bool(getattr(args, "use_mask", False)),
         debug_inference=bool(getattr(args, "debug_inference", False)),
         save_mhr_params=bool(getattr(args, "save_mhr_params", False)),
+        person_select_strategy=getattr(args, "person_select_strategy", "largest_bbox"),
+        person_index=int(getattr(args, "person_index", 0)),
         frame_rel=getattr(args, "frame_rel", None),
         skip_inference=bool(getattr(args, "skip_inference", False)),
         skip_triangulation=bool(getattr(args, "skip_triangulation", False)),
@@ -628,6 +719,9 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
         bad_loss_threshold=float(getattr(args, "bad_loss_threshold", 3e-5)),
         bad_data_loss_threshold=float(getattr(args, "bad_data_loss_threshold", 2e-5)),
         bad_loss_growth_ratio=float(getattr(args, "bad_loss_growth_ratio", 1.5)),
+        min_valid_points=int(getattr(args, "min_valid_points", 6)),
+        zero_weight_strategy=getattr(args, "zero_weight_strategy", "uniform_finite"),
+        freeze_lower_body=bool(getattr(args, "freeze_lower_body", False)),
         topk_print=int(getattr(args, "topk_print", 10)),
         save_opt_debug=bool(getattr(args, "save_opt_debug", False)),
         bad_frame_max_retries=int(getattr(args, "bad_frame_max_retries", 2)),
@@ -678,14 +772,24 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
             raise FileNotFoundError(f"Numpy root not found: {npy_root}")
     else:
         inferred_npy_root = (inference_root / "npy").resolve()
+        stage1_meta_path = (inference_root / "stage1_meta.json").resolve()
+        expected_stage1_meta = _expected_stage1_meta(config=config, image_root=image_root)
         reuse_stage1 = False
         if (
             not config.overwrite
             and config.frame_rel is not None
             and inferred_npy_root.is_dir()
         ):
-            rel_dir = (inferred_npy_root / config.frame_rel).resolve()
-            if rel_dir.is_dir() and _dir_has_min_cam_predictions(rel_dir, config.cams, min_views=min_views):
+            rel_dir_path = (inferred_npy_root / config.frame_rel).resolve()
+            meta_matches = _stage1_meta_matches(
+                existing_meta=_load_stage1_meta(stage1_meta_path),
+                expected_meta=expected_stage1_meta,
+            )
+            if (
+                rel_dir_path.is_dir()
+                and _dir_has_min_cam_predictions(rel_dir_path, config.cams, min_views=min_views)
+                and meta_matches
+            ):
                 reuse_stage1 = True
 
         if reuse_stage1:
@@ -708,6 +812,8 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                 debug=config.debug_inference,
                 save_mhr_params=config.save_mhr_params,
                 include_rel_dirs=[config.frame_rel] if config.frame_rel else None,
+                person_select_strategy=config.person_select_strategy,
+                person_index=config.person_index,
             )
             demo_result = run_demo(demo_cfg)
             npy_root = demo_result.npy_root.resolve()
@@ -744,9 +850,14 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
             raise FileNotFoundError(
                 f"No frame has enough views (>= {min_views}) for optimization runtime initialization."
             )
+        runtime_seed_npy_dir = runtime_seed.npy_dir
+        if runtime_seed_npy_dir is None:
+            raise FileNotFoundError(
+                "Optimization runtime initialization failed: runtime seed has no npy_dir."
+            )
         runtime_cfg = OptimizationConfig(
             npz=Path("runtime.npz"),
-            npy_dir=runtime_seed.npy_dir,
+            npy_dir=runtime_seed_npy_dir,
             cams=list(runtime_seed.available_cams),
             out_npy=Path("runtime.npy"),
             debug_dir=(optimization_root / "debug_opt"),
@@ -755,6 +866,9 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
             mhr_pt=opt_mhr_pt,
             device=config.device,
             save_debug_artifacts=False,
+            min_valid_points=config.min_valid_points,
+            zero_weight_strategy=config.zero_weight_strategy,
+            freeze_lower_body=config.freeze_lower_body,
         )
         opt_runtime = build_optimization_runtime(runtime_cfg)
 
@@ -914,6 +1028,9 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                 bad_loss_threshold=config.bad_loss_threshold,
                 bad_data_loss_threshold=config.bad_data_loss_threshold,
                 bad_loss_growth_ratio=config.bad_loss_growth_ratio,
+                min_valid_points=config.min_valid_points,
+                zero_weight_strategy=config.zero_weight_strategy,
+                freeze_lower_body=config.freeze_lower_body,
                 topk_print=config.topk_print,
                 save_debug_artifacts=config.save_opt_debug,
             )
@@ -966,6 +1083,9 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                         bad_loss_threshold=config.bad_loss_threshold,
                         bad_data_loss_threshold=config.bad_data_loss_threshold,
                         bad_loss_growth_ratio=config.bad_loss_growth_ratio,
+                        min_valid_points=config.min_valid_points,
+                        zero_weight_strategy=config.zero_weight_strategy,
+                        freeze_lower_body=config.freeze_lower_body,
                         topk_print=config.topk_print,
                         save_debug_artifacts=config.save_opt_debug,
                     )
@@ -1012,11 +1132,11 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                 median_window=config.smoothing_median_window,
                 outlier_sigma=config.smoothing_outlier_sigma,
             )
-            for fr, d in zip(frame_results, smoothed_dicts):
-                if d is None:
+            for fr, smoothed_entry in zip(frame_results, smoothed_dicts):
+                if smoothed_entry is None:
                     continue
                 smoothed_out = (optimization_root / fr.rel_dir / config.smoothed_name).resolve()
-                save_npy_dict(smoothed_out, d)
+                save_npy_dict(smoothed_out, smoothed_entry)
                 fr.smoothed_npy = smoothed_out
 
         if config.debug_sequence or config.save_sequence_mp4:

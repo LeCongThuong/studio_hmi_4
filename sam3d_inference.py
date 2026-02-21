@@ -14,6 +14,7 @@ This module is intentionally usable in two ways:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -76,6 +77,8 @@ class Demo2Config:
     debug: bool = False
     save_mhr_params: bool = False
     include_rel_dirs: Optional[List[str]] = None
+    person_select_strategy: str = "largest_bbox"
+    person_index: int = 0
 
 
 @dataclass
@@ -200,7 +203,7 @@ def collect_images(image_root: str) -> List[str]:
         out = []
         for token in parts:
             if token.isdigit():
-                out.append((0, int(token)))
+                out.append((0, f"{int(token):020d}"))
             else:
                 out.append((1, token.lower()))
         return out
@@ -242,19 +245,46 @@ def move_mesh_files(
         shutil.move(src, mesh_out_dir / Path(src).name)
 
 
-def extract_primary_output(outputs: object) -> Optional[Dict[str, object]]:
+def extract_primary_output(
+    outputs: object,
+    strategy: str = "largest_bbox",
+    person_index: int = 0,
+) -> Optional[Dict[str, object]]:
     if outputs is None:
         return None
 
     if isinstance(outputs, Mapping):
         return dict(outputs)
 
-    if isinstance(outputs, (list, tuple)) and len(outputs) > 0:
-        first = outputs[0]
-        if isinstance(first, Mapping):
-            return dict(first)
+    if not isinstance(outputs, (list, tuple)) or len(outputs) == 0:
+        return None
 
-    return None
+    candidates = [o for o in outputs if isinstance(o, Mapping)]
+    if len(candidates) == 0:
+        return None
+
+    if strategy == "first":
+        return dict(candidates[0])
+    if strategy == "person_index":
+        idx = int(np.clip(int(person_index), 0, len(candidates) - 1))
+        return dict(candidates[idx])
+
+    def area(candidate: Mapping[str, object]) -> float:
+        bbox_obj = candidate.get("bbox", [0.0, 0.0, 0.0, 0.0])
+        bbox = np.asarray(bbox_obj, dtype=np.float32).reshape(-1)
+        if bbox.size < 4 or not np.isfinite(bbox[:4]).all():
+            return -1.0
+        x0, y0, x1, y1 = bbox[:4]
+        return float(max(0.0, x1 - x0) * max(0.0, y1 - y0))
+
+    best_candidate = candidates[0]
+    best_area = area(best_candidate)
+    for candidate in candidates[1:]:
+        candidate_area = area(candidate)
+        if candidate_area > best_area:
+            best_candidate = candidate
+            best_area = candidate_area
+    return dict(best_candidate)
 
 
 def save_dict_npy(data: Mapping[str, object], output_folder: Path, image_name: str) -> Path:
@@ -343,7 +373,11 @@ def run_demo(
             bbox_thr=config.bbox_thresh,
             use_mask=config.use_mask,
         )
-        output_dict = extract_primary_output(outputs)
+        output_dict = extract_primary_output(
+            outputs,
+            strategy=config.person_select_strategy,
+            person_index=config.person_index,
+        )
 
         rel_dir = _relative_dir(image_path, config.image_folder)
         image_name = Path(image_path).stem
@@ -393,6 +427,21 @@ def run_demo(
                 has_prediction=output_dict is not None,
             )
         )
+
+    meta = {
+        "image_folder": str(Path(config.image_folder).expanduser().resolve()),
+        "include_rel_dirs": list(config.include_rel_dirs) if config.include_rel_dirs else None,
+        "checkpoint_path": str(config.checkpoint_path),
+        "detector_name": str(config.detector_name),
+        "segmentor_name": str(config.segmentor_name),
+        "fov_name": str(config.fov_name),
+        "person_select_strategy": str(config.person_select_strategy),
+        "person_index": int(config.person_index),
+    }
+    (output_root / "stage1_meta.json").write_text(
+        json.dumps(meta, indent=2),
+        encoding="utf-8",
+    )
 
     return Demo2RunResult(
         output_root=output_root,
@@ -511,6 +560,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional relative subdirs under image_folder to process (e.g., 100 101).",
     )
+    parser.add_argument(
+        "--person_select_strategy",
+        type=str,
+        default="largest_bbox",
+        choices=["first", "largest_bbox", "person_index"],
+        help="How to pick a person when detector returns multiple outputs.",
+    )
+    parser.add_argument(
+        "--person_index",
+        type=int,
+        default=0,
+        help="Person index to use when --person_select_strategy=person_index.",
+    )
     return parser
 
 
@@ -538,6 +600,8 @@ def namespace_to_config(args: argparse.Namespace) -> Demo2Config:
         debug=args.debug,
         save_mhr_params=args.save_mhr_params,
         include_rel_dirs=args.include_rel_dirs,
+        person_select_strategy=args.person_select_strategy,
+        person_index=args.person_index,
     )
 
 

@@ -51,6 +51,8 @@ python run_full_pipeline.py \
 - `--skip_triangulation`: reuse existing triangulation files under `output_root/triangulation`.
 - `--skip_optimization`: stop after triangulation.
 - `--save_mhr_params`: save extracted MHR params from stage-1 under `inference/mhr_params`.
+- `--person_select_strategy largest_bbox`: choose stage-1 person selection mode (`first`, `largest_bbox`, `person_index`).
+- `--person_index 0`: used only with `--person_select_strategy person_index`.
 - `--save_triangulation_debug`: save overlay debug images for triangulation.
 - `--debug_inference` / `--debug_triangulation`: interactive/debug rendering for stage-1/stage-2.
 - For multi-frame runs, `--debug_triangulation` opens interactive 3D only on the first frame by default.
@@ -58,6 +60,8 @@ python run_full_pipeline.py \
 - `--min_views 2`: minimum available views for each frame optimization.
 - `--bad_loss_threshold 3e-5 --bad_data_loss_threshold 2e-5`: stricter bad-frame gate for non-human pose prevention.
 - `--bad_frame_max_retries 2`: retry bad frames with stronger temporal constraints.
+- `--min_valid_points 6 --zero_weight_strategy uniform_finite`: robust stage-3 valid-point/weight controls.
+- `--freeze_lower_body`: lock lower-body dimensions to initialization to reduce stationary-leg jitter.
 - `--smoothing_alpha 0.65 --smoothing_median_window 5 --smoothing_outlier_sigma 3.5`: sequence smoothing controls.
 - `--debug_4d --save_4d_mp4`: interactive 4D playback + MP4 export aliases.
 
@@ -67,6 +71,7 @@ python run_full_pipeline.py \
 
 - `inference/`
 - `inference/npy/...` per-camera SAM outputs
+- `inference/stage1_meta.json` stage-1 cache contract metadata
 - `inference/render/...` and `inference/mesh/...` if `--debug_inference`
 - `inference/mhr_params/...` if `--save_mhr_params`
 - `triangulation/.../triangulated.npz`
@@ -102,6 +107,7 @@ python sam3d_inference.py \
   --mhr_path ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt \
   --detector_name sam3 \
   --segmentor_name sam3 \
+  --person_select_strategy largest_bbox \
   --debug \
   --save_mhr_params
 ```
@@ -131,6 +137,9 @@ python optimize_mhr_pose.py \
   --with_scale \
   --iters 200 \
   --lr 0.05 \
+  --min_valid_points 6 \
+  --zero_weight_strategy uniform_finite \
+  --freeze_lower_body \
   --bad_loss_threshold 3e-5 \
   --bad_data_loss_threshold 2e-5 \
   --debug_dir /path/to/debug_opt \
@@ -157,3 +166,13 @@ You can import each stage directly:
 - `triangulate_mhr3d_gt.py`: `TriangulationConfig`, `run_triangulation`
 - `optimize_mhr_pose.py`: `OptimizationConfig`, `run_optimization`
 - `run_full_pipeline.py`: `FullPipelineConfig`, `run_full_pipeline`
+
+## Troubleshooting
+
+- `RuntimeError: Insufficient valid weighted points ...`:
+  - Increase available views.
+  - Check stage-2 triangulation validity for the frame.
+  - Lower `--min_valid_points` only if your view coverage is consistently sparse.
+- `RuntimeError: freeze_lower_body enabled but no hardcoded lower-body index table for pose_dim=...`:
+  - Disable `--freeze_lower_body` for that checkpoint/output format, or
+  - add the corresponding hardcoded table for that `pose_dim` in `optimize_mhr_pose.py`.

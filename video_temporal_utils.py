@@ -154,8 +154,10 @@ def smooth_frame_dict_sequence(
         for i, d in enumerate(out):
             if d is None or key not in d:
                 continue
-            arr = np.asarray(d[key])
+            arr = np.asarray(d[key], dtype=np.float32)
             if arr.shape != sample_shape or arr.dtype == object or not np.issubdtype(arr.dtype, np.number):
+                continue
+            if not np.isfinite(arr).all():
                 continue
             seq[i] = arr.astype(np.float32)
             valid[i] = True
@@ -168,6 +170,8 @@ def smooth_frame_dict_sequence(
         smoothed = _bidirectional_ema(filtered, alpha=alpha)
         for i, d in enumerate(out):
             if d is None:
+                continue
+            if not np.isfinite(smoothed[i]).all():
                 continue
             d[key] = smoothed[i].astype(np.float32)
 
