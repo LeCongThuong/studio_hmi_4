@@ -87,6 +87,7 @@ class FullPipelineConfig:
     robust_lm: bool = False
     robust_lm_delta: float = 10.0
     debug_triangulation: bool = False
+    debug_triangulation_every_frame: bool = False
     save_triangulation_debug: bool = False
     hf_repo: Optional[str] = None
     opt_ckpt: Optional[str] = None
@@ -485,6 +486,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--robust_lm", action="store_true", default=False)
     ap.add_argument("--robust_lm_delta", type=float, default=10.0)
     ap.add_argument("--debug_triangulation", action="store_true", default=False, help="Interactive 3D display.")
+    ap.add_argument(
+        "--debug_triangulation_every_frame",
+        action="store_true",
+        default=False,
+        help="When --debug_triangulation is enabled, show interactive 3D window for every frame (default: first frame only).",
+    )
     ap.add_argument("--save_triangulation_debug", action="store_true", default=False, help="Save per-frame overlay debug.")
 
     # Stage 3: Optimization
@@ -536,79 +543,107 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
     """Convert parsed CLI args to `FullPipelineConfig`."""
 
+    image_folder = getattr(args, "image_folder", None)
+    output_root = getattr(args, "output_root", None)
+    cams = getattr(args, "cams", None)
+    caliscope_toml = getattr(args, "caliscope_toml", None)
+    missing_required = [
+        name
+        for name, value in (
+            ("image_folder", image_folder),
+            ("output_root", output_root),
+            ("cams", cams),
+            ("caliscope_toml", caliscope_toml),
+        )
+        if value is None
+    ]
+    if missing_required:
+        raise AttributeError(
+            "Missing required args for namespace_to_config: "
+            + ", ".join(missing_required)
+        )
+
+    debug_sequence = bool(
+        getattr(args, "debug_sequence", False) or getattr(args, "debug_4d", False)
+    )
+    save_sequence_mp4 = bool(
+        getattr(args, "save_sequence_mp4", False) or getattr(args, "save_4d_mp4", False)
+    )
+
     return FullPipelineConfig(
-        image_folder=args.image_folder,
-        output_root=args.output_root,
-        cams=list(args.cams),
-        caliscope_toml=args.caliscope_toml,
-        mhr_py=args.mhr_py,
-        toml_sections=args.toml_sections,
-        checkpoint_path=args.checkpoint_path,
-        mhr_path=args.mhr_path,
-        detector_name=args.detector_name,
-        segmentor_name=args.segmentor_name,
-        fov_name=args.fov_name,
-        detector_path=args.detector_path,
-        segmentor_path=args.segmentor_path,
-        fov_path=args.fov_path,
-        bbox_thresh=args.bbox_thresh,
-        use_mask=args.use_mask,
-        debug_inference=args.debug_inference,
-        save_mhr_params=args.save_mhr_params,
-        frame_rel=args.frame_rel,
-        skip_inference=args.skip_inference,
-        skip_triangulation=args.skip_triangulation,
-        skip_optimization=args.skip_optimization,
-        overwrite=args.overwrite,
-        npy_root=args.npy_root,
-        triangulated_name=args.triangulated_name,
-        optimized_name=args.optimized_name,
-        normalized=args.normalized,
-        pixel=args.pixel,
-        invert_extrinsics=args.invert_extrinsics,
-        lm_iters=args.lm_iters,
-        lm_lambda=args.lm_lambda,
-        lm_eps=args.lm_eps,
-        score_type=args.score_type,
-        huber_delta=args.huber_delta,
-        inlier_thresh=args.inlier_thresh,
-        robust_lm=args.robust_lm,
-        robust_lm_delta=args.robust_lm_delta,
-        debug_triangulation=args.debug_triangulation,
-        save_triangulation_debug=args.save_triangulation_debug,
-        hf_repo=args.hf_repo,
-        opt_ckpt=args.opt_ckpt,
-        opt_mhr_pt=args.opt_mhr_pt,
-        device=args.device,
-        iters=args.iters,
-        lr=args.lr,
-        with_scale=args.with_scale,
-        huber_m=args.huber_m,
-        w_pose_reg=args.w_pose_reg,
-        w_temporal=args.w_temporal,
-        w_temporal_velocity=args.w_temporal_velocity,
-        w_temporal_accel=args.w_temporal_accel,
-        temporal_init_blend=args.temporal_init_blend,
-        temporal_extrapolation=args.temporal_extrapolation,
-        bad_loss_threshold=args.bad_loss_threshold,
-        bad_data_loss_threshold=args.bad_data_loss_threshold,
-        bad_loss_growth_ratio=args.bad_loss_growth_ratio,
-        topk_print=args.topk_print,
-        save_opt_debug=args.save_opt_debug,
-        bad_frame_max_retries=args.bad_frame_max_retries,
-        min_views=args.min_views,
-        recover_bad_frames=not args.no_recover_bad_frames,
-        fill_missing_frames=not args.no_fill_missing_frames,
-        enable_smoothing=not args.disable_smoothing,
-        smoothing_alpha=args.smoothing_alpha,
-        smoothing_median_window=args.smoothing_median_window,
-        smoothing_outlier_sigma=args.smoothing_outlier_sigma,
-        smoothed_name=args.smoothed_name,
-        debug_sequence=(args.debug_sequence or args.debug_4d),
-        save_sequence_mp4=(args.save_sequence_mp4 or args.save_4d_mp4),
-        sequence_mp4_name=args.sequence_mp4_name,
-        sequence_fps=args.sequence_fps,
-        save_summary_json=not args.no_summary_json,
+        image_folder=str(image_folder),
+        output_root=str(output_root),
+        cams=list(cams),
+        caliscope_toml=str(caliscope_toml),
+        mhr_py=getattr(args, "mhr_py", "mhr70.py"),
+        toml_sections=getattr(args, "toml_sections", None),
+        checkpoint_path=getattr(args, "checkpoint_path", ""),
+        mhr_path=getattr(args, "mhr_path", ""),
+        detector_name=getattr(args, "detector_name", "vitdet"),
+        segmentor_name=getattr(args, "segmentor_name", "sam2"),
+        fov_name=getattr(args, "fov_name", "moge2"),
+        detector_path=getattr(args, "detector_path", ""),
+        segmentor_path=getattr(args, "segmentor_path", ""),
+        fov_path=getattr(args, "fov_path", ""),
+        bbox_thresh=float(getattr(args, "bbox_thresh", 0.8)),
+        use_mask=bool(getattr(args, "use_mask", False)),
+        debug_inference=bool(getattr(args, "debug_inference", False)),
+        save_mhr_params=bool(getattr(args, "save_mhr_params", False)),
+        frame_rel=getattr(args, "frame_rel", None),
+        skip_inference=bool(getattr(args, "skip_inference", False)),
+        skip_triangulation=bool(getattr(args, "skip_triangulation", False)),
+        skip_optimization=bool(getattr(args, "skip_optimization", False)),
+        overwrite=bool(getattr(args, "overwrite", False)),
+        npy_root=getattr(args, "npy_root", None),
+        triangulated_name=getattr(args, "triangulated_name", "triangulated.npz"),
+        optimized_name=getattr(args, "optimized_name", "opt_out.npy"),
+        normalized=bool(getattr(args, "normalized", False)),
+        pixel=bool(getattr(args, "pixel", False)),
+        invert_extrinsics=bool(getattr(args, "invert_extrinsics", False)),
+        lm_iters=int(getattr(args, "lm_iters", 25)),
+        lm_lambda=float(getattr(args, "lm_lambda", 1e-3)),
+        lm_eps=float(getattr(args, "lm_eps", 1e-4)),
+        score_type=getattr(args, "score_type", "median"),
+        huber_delta=float(getattr(args, "huber_delta", 10.0)),
+        inlier_thresh=float(getattr(args, "inlier_thresh", 30.0)),
+        robust_lm=bool(getattr(args, "robust_lm", False)),
+        robust_lm_delta=float(getattr(args, "robust_lm_delta", 10.0)),
+        debug_triangulation=bool(getattr(args, "debug_triangulation", False)),
+        debug_triangulation_every_frame=bool(getattr(args, "debug_triangulation_every_frame", False)),
+        save_triangulation_debug=bool(getattr(args, "save_triangulation_debug", False)),
+        hf_repo=getattr(args, "hf_repo", None),
+        opt_ckpt=getattr(args, "opt_ckpt", None),
+        opt_mhr_pt=getattr(args, "opt_mhr_pt", ""),
+        device=getattr(args, "device", "cuda"),
+        iters=int(getattr(args, "iters", 200)),
+        lr=float(getattr(args, "lr", 5e-2)),
+        with_scale=bool(getattr(args, "with_scale", False)),
+        huber_m=float(getattr(args, "huber_m", 0.03)),
+        w_pose_reg=float(getattr(args, "w_pose_reg", 1e-3)),
+        w_temporal=float(getattr(args, "w_temporal", 3e-3)),
+        w_temporal_velocity=float(getattr(args, "w_temporal_velocity", 2e-3)),
+        w_temporal_accel=float(getattr(args, "w_temporal_accel", 5e-4)),
+        temporal_init_blend=float(getattr(args, "temporal_init_blend", 0.7)),
+        temporal_extrapolation=float(getattr(args, "temporal_extrapolation", 1.0)),
+        bad_loss_threshold=float(getattr(args, "bad_loss_threshold", 3e-5)),
+        bad_data_loss_threshold=float(getattr(args, "bad_data_loss_threshold", 2e-5)),
+        bad_loss_growth_ratio=float(getattr(args, "bad_loss_growth_ratio", 1.5)),
+        topk_print=int(getattr(args, "topk_print", 10)),
+        save_opt_debug=bool(getattr(args, "save_opt_debug", False)),
+        bad_frame_max_retries=int(getattr(args, "bad_frame_max_retries", 2)),
+        min_views=int(getattr(args, "min_views", 2)),
+        recover_bad_frames=not bool(getattr(args, "no_recover_bad_frames", False)),
+        fill_missing_frames=not bool(getattr(args, "no_fill_missing_frames", False)),
+        enable_smoothing=not bool(getattr(args, "disable_smoothing", False)),
+        smoothing_alpha=float(getattr(args, "smoothing_alpha", 0.65)),
+        smoothing_median_window=int(getattr(args, "smoothing_median_window", 5)),
+        smoothing_outlier_sigma=float(getattr(args, "smoothing_outlier_sigma", 3.5)),
+        smoothed_name=getattr(args, "smoothed_name", "opt_out_smoothed.npy"),
+        debug_sequence=debug_sequence,
+        save_sequence_mp4=save_sequence_mp4,
+        sequence_mp4_name=getattr(args, "sequence_mp4_name", "sequence_debug.mp4"),
+        sequence_fps=int(getattr(args, "sequence_fps", 20)),
+        save_summary_json=not bool(getattr(args, "no_summary_json", False)),
     )
 
 
@@ -690,6 +725,15 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
             f"No frame directories with camera predictions {config.cams} found under {npy_root}"
         )
 
+    total_frames = len(frame_inputs)
+    tri_debug_shown_once = False
+    if config.debug_triangulation and (not config.debug_triangulation_every_frame) and total_frames > 1:
+        print(
+            "[PIPELINE] --debug_triangulation enabled for sequence: "
+            "interactive 3D debug will open only for the first processed frame. "
+            "Use --debug_triangulation_every_frame to force every frame."
+        )
+
     opt_runtime = None
     if not config.skip_optimization:
         runtime_seed = next(
@@ -758,6 +802,13 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                 print(f"[PIPELINE] Reusing triangulation: {tri_out}")
             else:
                 try:
+                    tri_debug_enabled = bool(
+                        config.debug_triangulation
+                        and (
+                            config.debug_triangulation_every_frame
+                            or (not tri_debug_shown_once)
+                        )
+                    )
                     tri_cfg = TriangulationConfig(
                         mhr_py=config.mhr_py,
                         caliscope_toml=config.caliscope_toml,
@@ -771,7 +822,7 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                         lm_iters=config.lm_iters,
                         lm_lambda=config.lm_lambda,
                         lm_eps=config.lm_eps,
-                        debug=config.debug_triangulation,
+                        debug=tri_debug_enabled,
                         debug_dir=str(tri_debug_dir) if tri_debug_dir else None,
                         img_dir=str(img_dir),
                         score_type=config.score_type,
@@ -781,6 +832,8 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                         robust_lm_delta=config.robust_lm_delta,
                     )
                     run_triangulation(tri_cfg)
+                    if tri_debug_enabled and (not config.debug_triangulation_every_frame):
+                        tri_debug_shown_once = True
                 except Exception as exc:
                     fr.status = "triangulation_failed"
                     fr.error = f"{type(exc).__name__}: {exc}"

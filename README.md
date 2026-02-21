@@ -53,6 +53,8 @@ python run_full_pipeline.py \
 - `--save_mhr_params`: save extracted MHR params from stage-1 under `inference/mhr_params`.
 - `--save_triangulation_debug`: save overlay debug images for triangulation.
 - `--debug_inference` / `--debug_triangulation`: interactive/debug rendering for stage-1/stage-2.
+- For multi-frame runs, `--debug_triangulation` opens interactive 3D only on the first frame by default.
+- `--debug_triangulation_every_frame`: force interactive 3D popup on every frame.
 - `--min_views 2`: minimum available views for each frame optimization.
 - `--bad_loss_threshold 3e-5 --bad_data_loss_threshold 2e-5`: stricter bad-frame gate for non-human pose prevention.
 - `--bad_frame_max_retries 2`: retry bad frames with stronger temporal constraints.
