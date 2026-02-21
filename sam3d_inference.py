@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from glob import glob
@@ -193,11 +194,23 @@ def build_estimator(config: Demo2Config) -> SAM3DBodyEstimator:
 
 
 def collect_images(image_root: str) -> List[str]:
-    return sorted(
+    def _natural_key(p: str):
+        rel = os.path.relpath(p, image_root)
+        parts = re.split(r"(\d+)", rel.replace("\\", "/"))
+        out = []
+        for token in parts:
+            if token.isdigit():
+                out.append((0, int(token)))
+            else:
+                out.append((1, token.lower()))
+        return out
+
+    images = [
         image
         for ext in IMAGE_EXTENSIONS
         for image in glob(os.path.join(image_root, "**", ext), recursive=True)
-    )
+    ]
+    return sorted(images, key=_natural_key)
 
 
 def collect_ply_paths(ply_files: Optional[Iterable[str]]) -> List[str]:

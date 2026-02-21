@@ -21,6 +21,10 @@ Two supported layouts:
 2. Multi-frame folders:
 `<image_folder>/<frame_id>/left.jpg`, `<image_folder>/<frame_id>/front.jpg`, `<image_folder>/<frame_id>/right.jpg`
 
+Recommended video layout:
+
+`input_frames/<k>/<cam>.jpg` where `k` is `0,1,2,...` and each frame can have variable camera count.
+
 The `--cams` names must match these stems.
 
 ## One-Command Full Pipeline
@@ -49,6 +53,11 @@ python run_full_pipeline.py \
 - `--save_mhr_params`: save extracted MHR params from stage-1 under `inference/mhr_params`.
 - `--save_triangulation_debug`: save overlay debug images for triangulation.
 - `--debug_inference` / `--debug_triangulation`: interactive/debug rendering for stage-1/stage-2.
+- `--min_views 2`: minimum available views for each frame optimization.
+- `--bad_loss_threshold 3e-5 --bad_data_loss_threshold 2e-5`: stricter bad-frame gate for non-human pose prevention.
+- `--bad_frame_max_retries 2`: retry bad frames with stronger temporal constraints.
+- `--smoothing_alpha 0.65 --smoothing_median_window 5 --smoothing_outlier_sigma 3.5`: sequence smoothing controls.
+- `--debug_4d --save_4d_mp4`: interactive 4D playback + MP4 export aliases.
 
 ## Output Structure
 
@@ -61,7 +70,10 @@ python run_full_pipeline.py \
 - `triangulation/.../triangulated.npz`
 - `triangulation/.../debug/` if `--save_triangulation_debug`
 - `optimization/.../opt_out.npy`
+- `optimization/.../opt_out_smoothed.npy` (if smoothing enabled)
 - `optimization/.../debug_opt/`
+- `sequence_summary.json`
+- `sequence_debug.mp4` (if `--save_sequence_mp4` or `--save_4d_mp4`)
 
 ## Run Stages Manually (Debug)
 
@@ -73,6 +85,10 @@ python3 extract_per_tick_frames_from_csv.py \
   --out /path/to/frames_out \
   --cams all
 ```
+
+Extractor now also writes:
+- `frames_index.csv`: per-image row index.
+- `frames_manifest.csv`: per-timeframe camera availability (`id`, `num_views`, `cams_present`, `missing_cams`).
 
 ### 1) Stage 1: SAM Inference
 
@@ -113,6 +129,8 @@ python optimize_mhr_pose.py \
   --with_scale \
   --iters 200 \
   --lr 0.05 \
+  --bad_loss_threshold 3e-5 \
+  --bad_data_loss_threshold 2e-5 \
   --debug_dir /path/to/debug_opt \
   --out_npy /path/to/opt_out.npy
 ```

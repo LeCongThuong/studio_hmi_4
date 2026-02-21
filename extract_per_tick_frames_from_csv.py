@@ -50,6 +50,7 @@ For each tick id (k), writes:
 
 Also writes:
   OUT/frames_index.csv
+  OUT/frames_manifest.csv
 
 Usage
 -----
@@ -499,11 +500,32 @@ def main() -> None:
                 str(path),
             ])
 
+    # Write per-frame view manifest for variable-view video sequences.
+    views_by_id: Dict[str, Set[str]] = {}
+    for (id_str, cam, _frame_idx, _tick_ms, _act_ms, _dec_idx, _path) in all_rows:
+        views_by_id.setdefault(id_str, set()).add(cam)
+    manifest_path = args.out / "frames_manifest.csv"
+    with manifest_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["id", "num_views", "cams_present", "missing_cams"])
+        all_ids = sorted(views_by_id.keys(), key=lambda s: int(s) if s.isdigit() else s)
+        requested_cams = sorted(cam_keys)
+        for id_str in all_ids:
+            present = sorted(views_by_id.get(id_str, set()))
+            missing = sorted(set(requested_cams) - set(present))
+            w.writerow([
+                id_str,
+                len(present),
+                " ".join(present),
+                " ".join(missing),
+            ])
+
     ids_done = len(set(r[0] for r in all_rows))
     cams_done = len(set(r[1] for r in all_rows))
     print(f"[done] IDs processed: {ids_done} | cameras written: {cams_done}")
     print(f"[done] Output root: {args.out.resolve()}")
     print(f"[done] Index CSV:   {index_path.resolve()}")
+    print(f"[done] Manifest:    {manifest_path.resolve()}")
 
 
 if __name__ == "__main__":

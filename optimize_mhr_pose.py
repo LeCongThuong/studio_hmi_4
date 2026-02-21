@@ -74,6 +74,18 @@ class OptimizationConfig:
     min_iters: int = 50
     early_stop_patience: int = 60
     early_stop_tol: float = 1e-6
+    init_body_pose: Optional[np.ndarray] = None
+    init_prev_body_pose: Optional[np.ndarray] = None
+    init_prev_prev_body_pose: Optional[np.ndarray] = None
+    temporal_init_blend: float = 0.7
+    temporal_extrapolation: float = 1.0
+    w_temporal: float = 3e-3
+    w_temporal_velocity: float = 2e-3
+    w_temporal_accel: float = 5e-4
+    bad_loss_threshold: float = 3e-5
+    bad_data_loss_threshold: float = 2e-5
+    bad_loss_growth_ratio: float = 1.5
+    loss_divergence_ratio: float = 3.0
 
 
 @dataclass
@@ -84,6 +96,14 @@ class OptimizationRunResult:
     debug_dir: Path
     best_cam: str
     loss_history: List[float]
+    best_loss: float
+    final_loss: float
+    best_data_loss: float
+    final_data_loss: float
+    best_iter: int
+    used_temporal_init: bool
+    is_bad_loss: bool
+    best_pose: np.ndarray
 
 
 @dataclass
@@ -160,6 +180,15 @@ def safe_numpy_item_load(npy_path: Path):
     raise ValueError(f"Unexpected npy content at {npy_path}: {type(d)}")
 
 
+def load_body_pose_from_npy(npy_path: Optional[Path]) -> Optional[np.ndarray]:
+    if npy_path is None:
+        return None
+    data = safe_numpy_item_load(npy_path.expanduser().resolve())
+    if "body_pose_params" not in data:
+        raise KeyError(f"Missing 'body_pose_params' in temporal init file: {npy_path}")
+    return np.asarray(data["body_pose_params"], dtype=np.float32).reshape(-1)
+
+
 def find_npy_for_cam(npy_dir: Path, cam: str) -> Path:
     direct = npy_dir / f"{cam}.npy"
     if direct.exists():
@@ -178,6 +207,29 @@ def get_param_array(d: dict, key: str, device: torch.device) -> torch.Tensor:
 
     dim = DEFAULT_PARAM_DIMS[key]
     return to_torch(np.zeros(dim, np.float32), device).flatten()
+
+
+def safe_growth(final_value: float, best_value: float) -> float:
+    if not np.isfinite(final_value):
+        return float("inf")
+    return float(final_value / max(best_value, 1e-12))
+
+
+def classify_bad_optimization(
+    config: OptimizationConfig,
+    best_loss: float,
+    final_loss: float,
+    best_data_loss: float,
+    final_data_loss: float,
+) -> bool:
+    total_growth = safe_growth(final_loss, best_loss)
+    data_growth = safe_growth(final_data_loss, best_data_loss)
+    return bool(
+        (best_loss > float(config.bad_loss_threshold))
+        or (best_data_loss > float(config.bad_data_loss_threshold))
+        or (total_growth > float(config.bad_loss_growth_ratio))
+        or (data_growth > float(config.bad_loss_growth_ratio))
+    )
 
 
 # -----------------------------
@@ -381,11 +433,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--with_scale", action="store_true")
     ap.add_argument("--huber_m", type=float, default=0.03, help="Huber delta in meters")
     ap.add_argument("--w_pose_reg", type=float, default=1e-3)
+    ap.add_argument("--w_temporal", type=float, default=3e-3, help="Temporal pose prior weight when --init_pose_npy is provided.")
+    ap.add_argument("--w_temporal_velocity", type=float, default=2e-3, help="Weight for temporal velocity target (pose extrapolation from previous 2 frames).")
+    ap.add_argument("--w_temporal_accel", type=float, default=5e-4, help="Weight for temporal acceleration smoothing when previous 2 frames are available.")
+    ap.add_argument("--temporal_init_blend", type=float, default=0.7, help="Blend between per-view init and temporal init pose.")
+    ap.add_argument("--temporal_extrapolation", type=float, default=1.0, help="Extrapolation gain for temporal velocity target using prev and prev-prev poses.")
     ap.add_argument("--topk_print", type=int, default=10)
     ap.add_argument("--no_debug_artifacts", action="store_true", help="Skip debug plots/npz/ply for faster execution.")
     ap.add_argument("--min_iters", type=int, default=50, help="Minimum iterations before early stopping is allowed.")
     ap.add_argument("--early_stop_patience", type=int, default=60, help="Stop after this many non-improving iterations.")
     ap.add_argument("--early_stop_tol", type=float, default=1e-6, help="Minimum loss improvement to reset patience.")
+    ap.add_argument("--init_pose_npy", type=Path, default=None, help="Optional .npy with body_pose_params used as temporal initialization.")
+    ap.add_argument("--bad_loss_threshold", type=float, default=3e-5, help="Mark result bad when best total loss exceeds this value.")
+    ap.add_argument("--bad_data_loss_threshold", type=float, default=2e-5, help="Mark result bad when best data loss exceeds this value.")
+    ap.add_argument("--bad_loss_growth_ratio", type=float, default=1.5, help="Mark result bad when final_loss / best_loss exceeds this ratio.")
+    ap.add_argument("--loss_divergence_ratio", type=float, default=3.0, help="Early break when current loss diverges above best_loss by this ratio.")
     return ap
 
 
@@ -414,11 +476,21 @@ def namespace_to_config(args: argparse.Namespace) -> OptimizationConfig:
         with_scale=args.with_scale,
         huber_m=args.huber_m,
         w_pose_reg=args.w_pose_reg,
+        w_temporal=args.w_temporal,
+        w_temporal_velocity=args.w_temporal_velocity,
+        w_temporal_accel=args.w_temporal_accel,
+        temporal_init_blend=args.temporal_init_blend,
+        temporal_extrapolation=args.temporal_extrapolation,
         topk_print=args.topk_print,
         save_debug_artifacts=not args.no_debug_artifacts,
         min_iters=args.min_iters,
         early_stop_patience=args.early_stop_patience,
         early_stop_tol=args.early_stop_tol,
+        init_body_pose=load_body_pose_from_npy(args.init_pose_npy),
+        bad_loss_threshold=args.bad_loss_threshold,
+        bad_data_loss_threshold=args.bad_data_loss_threshold,
+        bad_loss_growth_ratio=args.bad_loss_growth_ratio,
+        loss_divergence_ratio=args.loss_divergence_ratio,
     )
 
 
@@ -529,12 +601,35 @@ def run_optimization(
 
     # Mask init pose (no in-place leaf issue here)
     init_pose = init_pose * keep_mask
+    temporal_prev_np = config.init_prev_body_pose
+    if temporal_prev_np is None:
+        # Backward-compatibility for existing callers.
+        temporal_prev_np = config.init_body_pose
+    temporal_prev_prev_np = config.init_prev_prev_body_pose
+
+    temporal_pose = None
+    temporal_prev_prev_pose = None
+    temporal_velocity_target = None
+    used_temporal_init = temporal_prev_np is not None
+    if temporal_prev_np is not None:
+        temporal_pose = to_torch(temporal_prev_np, device).flatten().to(torch.float32)
+        temporal_pose = temporal_pose * keep_mask
+        init_target = temporal_pose
+        if temporal_prev_prev_np is not None:
+            temporal_prev_prev_pose = to_torch(temporal_prev_prev_np, device).flatten().to(torch.float32)
+            temporal_prev_prev_pose = temporal_prev_prev_pose * keep_mask
+            extrap = float(np.clip(config.temporal_extrapolation, 0.0, 2.0))
+            temporal_velocity_target = temporal_pose + extrap * (temporal_pose - temporal_prev_prev_pose)
+            init_target = temporal_velocity_target
+        blend = float(np.clip(config.temporal_init_blend, 0.0, 1.0))
+        init_pose = (1.0 - blend) * init_pose + blend * init_target
 
     # ---- Optimize pose (leaf tensor) ----
     pose = init_pose.clone().detach().requires_grad_(True)
     opt = torch.optim.Adam([pose], lr=config.lr)
 
-    loss_hist = []
+    loss_hist: List[float] = []
+    data_loss_hist: List[float] = []
 
     # debug init plot
     if config.save_debug_artifacts:
@@ -557,7 +652,11 @@ def run_optimization(
     min_iters = max(1, min(int(config.min_iters), int(config.iters)))
     patience = max(1, int(config.early_stop_patience))
     improve_tol = max(0.0, float(config.early_stop_tol))
+    divergence_ratio = max(1.0, float(config.loss_divergence_ratio))
     best_loss = float("inf")
+    best_data_loss = float("inf")
+    best_iter = -1
+    best_pose = pose.detach().clone()
     no_improve = 0
     for it in range(config.iters):
         opt.zero_grad(set_to_none=True)
@@ -579,7 +678,25 @@ def run_optimization(
 
         loss_data = (wM_t * huber(r, delta=config.huber_m)).sum() / (wM_t.sum() + 1e-9)
         loss_reg = config.w_pose_reg * torch.mean((pose - init_pose) ** 2)
-        loss = loss_data + loss_reg
+        if temporal_pose is not None and config.w_temporal > 0:
+            loss_temporal = config.w_temporal * torch.mean((pose - temporal_pose) ** 2)
+        else:
+            loss_temporal = torch.zeros((), device=device, dtype=torch.float32)
+        if temporal_velocity_target is not None and config.w_temporal_velocity > 0:
+            loss_temporal_velocity = config.w_temporal_velocity * torch.mean((pose - temporal_velocity_target) ** 2)
+        else:
+            loss_temporal_velocity = torch.zeros((), device=device, dtype=torch.float32)
+        if (
+            temporal_pose is not None
+            and temporal_prev_prev_pose is not None
+            and config.w_temporal_accel > 0
+        ):
+            prev_vel = temporal_pose - temporal_prev_prev_pose
+            cur_vel = pose - temporal_pose
+            loss_temporal_accel = config.w_temporal_accel * torch.mean((cur_vel - prev_vel) ** 2)
+        else:
+            loss_temporal_accel = torch.zeros((), device=device, dtype=torch.float32)
+        loss = loss_data + loss_reg + loss_temporal + loss_temporal_velocity + loss_temporal_accel
 
         loss.backward()
 
@@ -597,18 +714,43 @@ def run_optimization(
             pose.mul_(keep_mask)
 
         loss_hist.append(float(loss.detach().cpu().item()))
+        data_loss_hist.append(float(loss_data.detach().cpu().item()))
         if it % 25 == 0 or it == config.iters - 1:
-            print(f"[{it:04d}] loss={loss_hist[-1]:.6f} data={float(loss_data):.6f}")
+            print(
+                f"[{it:04d}] loss={loss_hist[-1]:.6f} "
+                f"data={float(loss_data.detach().cpu().item()):.6f} "
+                f"temporal={float(loss_temporal.detach().cpu().item()):.6f} "
+                f"vel={float(loss_temporal_velocity.detach().cpu().item()):.6f} "
+                f"accel={float(loss_temporal_accel.detach().cpu().item()):.6f}"
+            )
 
         cur_loss = loss_hist[-1]
+        cur_data_loss = data_loss_hist[-1]
         if cur_loss < (best_loss - improve_tol):
             best_loss = cur_loss
+            best_iter = it
+            best_pose = pose.detach().clone()
             no_improve = 0
         else:
             no_improve += 1
+        if cur_data_loss < best_data_loss:
+            best_data_loss = cur_data_loss
+        if (it + 1) >= min_iters and np.isfinite(best_loss) and cur_loss > (best_loss * divergence_ratio):
+            print(
+                f"[diverge-stop] iter={it:04d} cur_loss={cur_loss:.6f} "
+                f"best_loss={best_loss:.6f} ratio={cur_loss / max(best_loss, 1e-12):.2f}"
+            )
+            break
         if (it + 1) >= min_iters and no_improve >= patience:
             print(f"[early-stop] iter={it:04d} best_loss={best_loss:.6f}")
             break
+
+    final_loss = float(loss_hist[-1]) if loss_hist else float("inf")
+    final_data_loss = float(data_loss_hist[-1]) if data_loss_hist else float("inf")
+    if best_iter >= 0:
+        with torch.no_grad():
+            pose.copy_(best_pose)
+            pose.mul_(keep_mask)
 
     if config.save_debug_artifacts:
         plot_loss_curve(loss_hist, debug_dir / "loss_curve.png")
@@ -635,7 +777,12 @@ def run_optimization(
         jcoords_aligned = s * (jcoords @ R.T) + t[None, :]
         jrots_aligned = R[None, :, :] @ jrots  # optional consistency
 
-        rM = torch.sqrt(((k70_aligned[subset_idx] - gtM_t) ** 2).sum(dim=1) + 1e-12).cpu().numpy()
+        residual_subset = torch.sqrt(((k70_aligned[subset_idx] - gtM_t) ** 2).sum(dim=1) + 1e-12)
+        aligned_data_loss = (wM_t * huber(residual_subset, delta=config.huber_m)).sum() / (wM_t.sum() + 1e-9)
+        final_data_loss = float(aligned_data_loss.detach().cpu().item())
+        best_data_loss = min(best_data_loss, final_data_loss)
+
+        rM = residual_subset.cpu().numpy()
         worst = np.argsort(-rM)[: config.topk_print]
         print("\nTop residual points (subset indices):")
         for idx in worst:
@@ -669,6 +816,12 @@ def run_optimization(
                 final_R=R.cpu().numpy(),
                 final_t=t.cpu().numpy(),
                 loss_hist=np.array(loss_hist, dtype=np.float32),
+                data_loss_hist=np.array(data_loss_hist, dtype=np.float32),
+                best_loss=np.array(best_loss, dtype=np.float32),
+                final_loss=np.array(final_loss, dtype=np.float32),
+                best_data_loss=np.array(best_data_loss, dtype=np.float32),
+                final_data_loss=np.array(final_data_loss, dtype=np.float32),
+                best_iter=np.array(best_iter, dtype=np.int32),
                 residual_subset_m=np.array(rM, dtype=np.float32),
                 keep_mask=keep_mask.cpu().numpy(),
             )
@@ -690,21 +843,65 @@ def run_optimization(
         out_dict["opt_sim_R"] = R.cpu().numpy()
         out_dict["opt_sim_t"] = t.cpu().numpy()
         out_dict["opt_loss_hist"] = np.array(loss_hist, dtype=np.float32)
+        out_dict["opt_data_loss_hist"] = np.array(data_loss_hist, dtype=np.float32)
+        out_dict["opt_best_loss"] = float(best_loss)
+        out_dict["opt_final_loss"] = float(final_loss)
+        out_dict["opt_best_data_loss"] = float(best_data_loss)
+        out_dict["opt_final_data_loss"] = float(final_data_loss)
+        out_dict["opt_best_iter"] = int(best_iter)
+        growth = safe_growth(final_loss, best_loss)
+        data_growth = safe_growth(final_data_loss, best_data_loss)
+        out_dict["opt_loss_growth_ratio"] = growth
+        out_dict["opt_data_loss_growth_ratio"] = data_growth
+        out_dict["opt_used_temporal_init"] = int(used_temporal_init)
+        out_dict["opt_temporal_weight"] = float(config.w_temporal)
+        out_dict["opt_temporal_velocity_weight"] = float(config.w_temporal_velocity)
+        out_dict["opt_temporal_accel_weight"] = float(config.w_temporal_accel)
+        out_dict["opt_temporal_extrapolation"] = float(config.temporal_extrapolation)
         out_dict["opt_subset_indices"] = subset_idx
         out_dict["opt_points3d_refined"] = gtM
+
+        is_bad_loss = classify_bad_optimization(
+            config=config,
+            best_loss=best_loss,
+            final_loss=final_loss,
+            best_data_loss=best_data_loss,
+            final_data_loss=final_data_loss,
+        )
+        out_dict["opt_is_bad_loss"] = int(is_bad_loss)
 
         np.save(out_npy, out_dict, allow_pickle=True)
 
     print(f"\nSaved optimized npy: {out_npy}")
+    print(
+        f"[quality] best_loss={best_loss:.6f} final_loss={final_loss:.6f} "
+        f"best_data={best_data_loss:.6f} final_data={final_data_loss:.6f} "
+        f"best_iter={best_iter} temporal_init={int(used_temporal_init)}"
+    )
     if config.save_debug_artifacts:
         print(f"Saved debug dir: {debug_dir}")
     else:
         print("Debug artifacts disabled (--no_debug_artifacts).")
+    is_bad_loss = classify_bad_optimization(
+        config=config,
+        best_loss=best_loss,
+        final_loss=final_loss,
+        best_data_loss=best_data_loss,
+        final_data_loss=final_data_loss,
+    )
     return OptimizationRunResult(
         out_npy=out_npy,
         debug_dir=debug_dir,
         best_cam=best_cam,
         loss_history=loss_hist,
+        best_loss=float(best_loss),
+        final_loss=float(final_loss),
+        best_data_loss=float(best_data_loss),
+        final_data_loss=float(final_data_loss),
+        best_iter=int(best_iter),
+        used_temporal_init=bool(used_temporal_init),
+        is_bad_loss=is_bad_loss,
+        best_pose=(pose.detach() * keep_mask).cpu().numpy().astype(np.float32),
     )
 
 
