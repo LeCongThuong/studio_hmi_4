@@ -60,8 +60,11 @@ python run_full_pipeline.py \
 - `--min_views 2`: minimum available views for each frame optimization.
 - `--bad_loss_threshold 3e-5 --bad_data_loss_threshold 2e-5`: stricter bad-frame gate for non-human pose prevention.
 - `--bad_frame_max_retries 2`: retry bad frames with stronger temporal constraints.
+- `--max_stale_temporal_frames 40`: disable temporal priors after long non-good streaks to avoid stale-pose lock-in.
+- `--max_edge_recovery_copy_span 15`: cap one-sided recovery copy distance so long bad tails are not flattened to one repeated pose.
+- Reused optimization files that were recovered now keep a recovered status in summaries (not `ok`) and no longer report copied loss metrics as if they were fresh optimization results.
 - `--min_valid_points 6 --zero_weight_strategy uniform_finite`: robust stage-3 valid-point/weight controls.
-- `--freeze_lower_body`: lock lower-body dimensions to initialization to reduce stationary-leg jitter.
+- `--freeze_lower_body`: lock lower-body dimensions and (for sequence runs) reuse previous-frame similarity alignment for lower-body world stability.
 - `--smoothing_alpha 0.65 --smoothing_median_window 5 --smoothing_outlier_sigma 3.5`: sequence smoothing controls.
 - `--debug_4d --save_4d_mp4`: interactive 4D playback + MP4 export aliases.
 

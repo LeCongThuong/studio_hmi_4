@@ -117,6 +117,8 @@ class FullPipelineConfig:
     min_views: int = 2
     recover_bad_frames: bool = True
     fill_missing_frames: bool = True
+    max_stale_temporal_frames: int = 40
+    max_edge_recovery_copy_span: int = 15
     enable_smoothing: bool = True
     smoothing_alpha: float = 0.65
     smoothing_median_window: int = 5
@@ -351,6 +353,44 @@ def _load_pose_if_good(opt_npy: Path) -> Optional[np.ndarray]:
     return np.asarray(d["body_pose_params"], dtype=np.float32).reshape(-1)
 
 
+def _load_similarity_if_good(opt_npy: Path) -> Optional[tuple[float, np.ndarray, np.ndarray]]:
+    try:
+        d = load_npy_dict(opt_npy)
+    except Exception:
+        return None
+    is_bad = bool(int(np.asarray(d.get("opt_is_bad_loss", 0)).reshape(())))
+    if is_bad:
+        return None
+    if "opt_sim_scale" not in d or "opt_sim_R" not in d or "opt_sim_t" not in d:
+        return None
+    sim_scale = float(np.asarray(d["opt_sim_scale"]).reshape(()))
+    sim_R = np.asarray(d["opt_sim_R"], dtype=np.float32).reshape(3, 3)
+    sim_t = np.asarray(d["opt_sim_t"], dtype=np.float32).reshape(3)
+    if not np.isfinite(sim_scale):
+        return None
+    if not np.isfinite(sim_R).all() or not np.isfinite(sim_t).all():
+        return None
+    return sim_scale, sim_R, sim_t
+
+
+def _safe_scalar_float(d: Dict[str, Any], key: str) -> Optional[float]:
+    if key not in d:
+        return None
+    try:
+        return float(np.asarray(d[key]).reshape(()))
+    except Exception:
+        return None
+
+
+def _safe_scalar_int(d: Dict[str, Any], key: str) -> Optional[int]:
+    if key not in d:
+        return None
+    try:
+        return int(np.asarray(d[key]).reshape(()))
+    except Exception:
+        return None
+
+
 def _push_temporal_pose_history(
     prev_pose: Optional[np.ndarray],
     prev_prev_pose: Optional[np.ndarray],
@@ -361,10 +401,20 @@ def _push_temporal_pose_history(
     return updated_prev, updated_prev_prev
 
 
+def _stale_frame_run_length(frame_results: Sequence[FramePipelineResult]) -> int:
+    stale = 0
+    for fr in reversed(frame_results):
+        if (fr.status in {"ok", "recovered_retry"}) and (not fr.is_bad_loss):
+            break
+        stale += 1
+    return stale
+
+
 def _recover_missing_and_bad_frames(
     frame_results: List[FramePipelineResult],
     optimization_root: Path,
     optimized_name: str,
+    max_edge_copy_span: int,
 ) -> List[Optional[Dict[str, Any]]]:
     frame_dicts: List[Optional[Dict[str, Any]]] = [None] * len(frame_results)
     valid: List[bool] = [False] * len(frame_results)
@@ -396,6 +446,10 @@ def _recover_missing_and_bad_frames(
         if not need_recover:
             continue
 
+        # Do not let bad/unusable frame payloads leak into smoothing/debug by default.
+        frame_dicts[i] = None
+        valid[i] = False
+
         prev_i = next((j for j in range(i - 1, -1, -1) if valid[j] and frame_dicts[j] is not None), None)
         next_i = next((j for j in range(i + 1, len(frame_results)) if valid[j] and frame_dicts[j] is not None), None)
         if prev_i is None and next_i is None:
@@ -418,6 +472,8 @@ def _recover_missing_and_bad_frames(
             fr.status = "recovered_interpolated"
             fr.recovered_from = f"{frame_results[prev_i].rel_dir}->{frame_results[next_i].rel_dir}"
         elif prev_i is not None:
+            if int(i - prev_i) > int(max(0, max_edge_copy_span)):
+                continue
             prev_dict = frame_dicts[prev_i]
             if prev_dict is None:
                 continue
@@ -427,12 +483,37 @@ def _recover_missing_and_bad_frames(
         else:
             if next_i is None:
                 continue
+            if int(next_i - i) > int(max(0, max_edge_copy_span)):
+                continue
             next_dict = frame_dicts[next_i]
             if next_dict is None:
                 continue
             recovered = copy_frame_dict(next_dict, mode="copy_next")
             fr.status = "recovered_copy_next"
             fr.recovered_from = frame_results[next_i].rel_dir
+
+        # Recovered frames are synthetic; copied optimization metrics from neighbor
+        # frames are misleading and must not be interpreted as this frame's optimize stats.
+        for k in (
+            "opt_loss_hist",
+            "opt_data_loss_hist",
+            "opt_best_loss",
+            "opt_final_loss",
+            "opt_best_data_loss",
+            "opt_final_data_loss",
+            "opt_best_iter",
+            "opt_loss_growth_ratio",
+            "opt_data_loss_growth_ratio",
+            "opt_used_temporal_init",
+            "opt_temporal_weight",
+            "opt_temporal_velocity_weight",
+            "opt_temporal_accel_weight",
+            "opt_temporal_extrapolation",
+            "opt_sim_reused_prev",
+        ):
+            if k in recovered:
+                recovered.pop(k, None)
+        recovered["opt_recovered_from"] = "" if fr.recovered_from is None else fr.recovered_from
 
         save_npy_dict(out_path, recovered)
         fr.optimized_npy = out_path
@@ -547,6 +628,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min_views", type=int, default=2, help="Minimum available views required per frame.")
     ap.add_argument("--no_recover_bad_frames", action="store_true", help="Disable recovery for bad/failed frames.")
     ap.add_argument("--no_fill_missing_frames", action="store_true", help="Disable insertion of missing numeric frame folders.")
+    ap.add_argument(
+        "--max_stale_temporal_frames",
+        type=int,
+        default=40,
+        help="Disable temporal init/priors after this many consecutive non-good frames (0 disables this safeguard).",
+    )
+    ap.add_argument(
+        "--max_edge_recovery_copy_span",
+        type=int,
+        default=15,
+        help="Max frame distance for one-sided recovery copy (copy_prev/copy_next). Larger gaps stay unrecovered.",
+    )
 
     # Stage 2: Triangulation + BA
     ap.add_argument("--normalized", action="store_true", default=False)
@@ -728,6 +821,8 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
         min_views=int(getattr(args, "min_views", 2)),
         recover_bad_frames=not bool(getattr(args, "no_recover_bad_frames", False)),
         fill_missing_frames=not bool(getattr(args, "no_fill_missing_frames", False)),
+        max_stale_temporal_frames=int(getattr(args, "max_stale_temporal_frames", 40)),
+        max_edge_recovery_copy_span=int(getattr(args, "max_edge_recovery_copy_span", 15)),
         enable_smoothing=not bool(getattr(args, "disable_smoothing", False)),
         smoothing_alpha=float(getattr(args, "smoothing_alpha", 0.65)),
         smoothing_median_window=int(getattr(args, "smoothing_median_window", 5)),
@@ -874,6 +969,9 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
 
     prev_good_pose: Optional[np.ndarray] = None
     prev_prev_good_pose: Optional[np.ndarray] = None
+    prev_good_sim_scale: Optional[float] = None
+    prev_good_sim_R: Optional[np.ndarray] = None
+    prev_good_sim_t: Optional[np.ndarray] = None
     frame_results: List[FramePipelineResult] = []
     for idx, entry in enumerate(frame_inputs, start=1):
         rel_dir = entry.rel_dir
@@ -970,37 +1068,90 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
 
         if optimized_npy.exists() and not config.overwrite:
             print(f"[PIPELINE] Reusing optimized output: {optimized_npy}")
-            pose = _load_pose_if_good(optimized_npy)
-            if pose is not None:
-                prev_good_pose, prev_prev_good_pose = _push_temporal_pose_history(
-                    prev_pose=prev_good_pose,
-                    prev_prev_pose=prev_prev_good_pose,
-                    new_pose=pose,
-                )
-                fr.status = "ok"
-            else:
-                fr.status = "bad_loss"
-                fr.is_bad_loss = True
             try:
                 d = load_npy_dict(optimized_npy)
-                if "opt_best_loss" in d:
-                    fr.best_loss = float(np.asarray(d["opt_best_loss"]).reshape(()))
-                if "opt_final_loss" in d:
-                    fr.final_loss = float(np.asarray(d["opt_final_loss"]).reshape(()))
-                if "opt_best_data_loss" in d:
-                    fr.best_data_loss = float(np.asarray(d["opt_best_data_loss"]).reshape(()))
-                if "opt_final_data_loss" in d:
-                    fr.final_data_loss = float(np.asarray(d["opt_final_data_loss"]).reshape(()))
-                if "opt_best_iter" in d:
-                    fr.best_iter = int(np.asarray(d["opt_best_iter"]).reshape(()))
-                if "opt_is_bad_loss" in d:
-                    fr.is_bad_loss = bool(int(np.asarray(d["opt_is_bad_loss"]).reshape(())))
-                    if fr.is_bad_loss:
-                        fr.status = "bad_loss"
+                is_bad = bool(int(np.asarray(d.get("opt_is_bad_loss", 0)).reshape(())))
+                is_recovered = bool(int(np.asarray(d.get("opt_recovered", 0)).reshape(())))
+
+                pose = None
+                if (not is_bad) and ("body_pose_params" in d):
+                    try:
+                        pose = np.asarray(d["body_pose_params"], dtype=np.float32).reshape(-1)
+                    except Exception:
+                        pose = None
+
+                if pose is not None:
+                    if is_recovered:
+                        mode = str(d.get("opt_recovery_mode", "")).strip()
+                        if mode == "copy_prev":
+                            fr.status = "recovered_copy_prev"
+                        elif mode == "copy_next":
+                            fr.status = "recovered_copy_next"
+                        elif mode == "interpolate":
+                            fr.status = "recovered_interpolated"
+                        else:
+                            fr.status = "recovered"
+                        rec_from = str(d.get("opt_recovered_from", "")).strip()
+                        fr.recovered_from = rec_from or None
+                    else:
+                        fr.status = "ok"
+                        prev_good_pose, prev_prev_good_pose = _push_temporal_pose_history(
+                            prev_pose=prev_good_pose,
+                            prev_prev_pose=prev_prev_good_pose,
+                            new_pose=pose,
+                        )
+                        sim = _load_similarity_if_good(optimized_npy)
+                        if sim is not None:
+                            prev_good_sim_scale = float(sim[0])
+                            prev_good_sim_R = sim[1].copy()
+                            prev_good_sim_t = sim[2].copy()
+                else:
+                    fr.status = "bad_loss"
+                    fr.is_bad_loss = True
+
+                # Recovered artifacts intentionally do not carry valid per-frame optimization metrics.
+                if is_recovered:
+                    fr.best_loss = None
+                    fr.final_loss = None
+                    fr.best_data_loss = None
+                    fr.final_data_loss = None
+                    fr.best_iter = None
+                    fr.is_bad_loss = False
+                else:
+                    fr.best_loss = _safe_scalar_float(d, "opt_best_loss")
+                    fr.final_loss = _safe_scalar_float(d, "opt_final_loss")
+                    fr.best_data_loss = _safe_scalar_float(d, "opt_best_data_loss")
+                    fr.final_data_loss = _safe_scalar_float(d, "opt_final_data_loss")
+                    fr.best_iter = _safe_scalar_int(d, "opt_best_iter")
+                    if "opt_is_bad_loss" in d:
+                        fr.is_bad_loss = bool(int(np.asarray(d["opt_is_bad_loss"]).reshape(())))
+                        if fr.is_bad_loss:
+                            fr.status = "bad_loss"
             except Exception:
                 pass
             frame_results.append(fr)
             continue
+
+        stale_run = _stale_frame_run_length(frame_results)
+        temporal_guard_enabled = int(config.max_stale_temporal_frames) > 0
+        use_temporal_priors = not (
+            temporal_guard_enabled and stale_run >= int(config.max_stale_temporal_frames)
+        )
+        if not use_temporal_priors:
+            print(
+                f"[PIPELINE] Temporal priors disabled at '{rel_dir}' after "
+                f"{stale_run} consecutive non-good frames."
+            )
+
+        init_prev_body_pose = None if (not use_temporal_priors or prev_good_pose is None) else prev_good_pose.copy()
+        init_prev_prev_body_pose = (
+            None
+            if (not use_temporal_priors or prev_prev_good_pose is None)
+            else prev_prev_good_pose.copy()
+        )
+        init_prev_sim_scale = None if (not use_temporal_priors) else prev_good_sim_scale
+        init_prev_sim_R = None if (not use_temporal_priors or prev_good_sim_R is None) else prev_good_sim_R.copy()
+        init_prev_sim_t = None if (not use_temporal_priors or prev_good_sim_t is None) else prev_good_sim_t.copy()
 
         try:
             opt_cfg = OptimizationConfig(
@@ -1023,8 +1174,11 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                 w_temporal_accel=config.w_temporal_accel,
                 temporal_init_blend=config.temporal_init_blend,
                 temporal_extrapolation=config.temporal_extrapolation,
-                init_prev_body_pose=None if prev_good_pose is None else prev_good_pose.copy(),
-                init_prev_prev_body_pose=None if prev_prev_good_pose is None else prev_prev_good_pose.copy(),
+                init_prev_body_pose=init_prev_body_pose,
+                init_prev_prev_body_pose=init_prev_prev_body_pose,
+                init_prev_sim_scale=init_prev_sim_scale,
+                init_prev_sim_R=init_prev_sim_R,
+                init_prev_sim_t=init_prev_sim_t,
                 bad_loss_threshold=config.bad_loss_threshold,
                 bad_data_loss_threshold=config.bad_data_loss_threshold,
                 bad_loss_growth_ratio=config.bad_loss_growth_ratio,
@@ -1044,6 +1198,9 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                     prev_prev_pose=prev_prev_good_pose,
                     new_pose=opt_res.best_pose,
                 )
+                prev_good_sim_scale = float(opt_res.sim_scale)
+                prev_good_sim_R = np.asarray(opt_res.sim_R, dtype=np.float32).copy()
+                prev_good_sim_t = np.asarray(opt_res.sim_t, dtype=np.float32).copy()
         except Exception as exc:
             fr.status = "optimization_failed"
             fr.error = f"{type(exc).__name__}: {exc}"
@@ -1052,7 +1209,12 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
             frame_results.append(fr)
             continue
 
-        if fr.is_bad_loss and config.recover_bad_frames and prev_good_pose is not None:
+        if (
+            fr.is_bad_loss
+            and config.recover_bad_frames
+            and prev_good_pose is not None
+            and use_temporal_priors
+        ):
             print(f"[PIPELINE] Retrying bad-loss frame '{rel_dir}' with stronger temporal prior")
             max_retries = max(1, int(config.bad_frame_max_retries))
             for retry_i in range(max_retries):
@@ -1080,6 +1242,9 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                         temporal_extrapolation=max(config.temporal_extrapolation, 1.0),
                         init_prev_body_pose=prev_good_pose.copy(),
                         init_prev_prev_body_pose=None if prev_prev_good_pose is None else prev_prev_good_pose.copy(),
+                        init_prev_sim_scale=prev_good_sim_scale,
+                        init_prev_sim_R=None if prev_good_sim_R is None else prev_good_sim_R.copy(),
+                        init_prev_sim_t=None if prev_good_sim_t is None else prev_good_sim_t.copy(),
                         bad_loss_threshold=config.bad_loss_threshold,
                         bad_data_loss_threshold=config.bad_data_loss_threshold,
                         bad_loss_growth_ratio=config.bad_loss_growth_ratio,
@@ -1105,6 +1270,9 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                                 prev_prev_pose=prev_prev_good_pose,
                                 new_pose=retry_res.best_pose,
                             )
+                            prev_good_sim_scale = float(retry_res.sim_scale)
+                            prev_good_sim_R = np.asarray(retry_res.sim_R, dtype=np.float32).copy()
+                            prev_good_sim_t = np.asarray(retry_res.sim_t, dtype=np.float32).copy()
                             break
                 except Exception as exc:
                     print(
@@ -1120,6 +1288,7 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
             frame_results=frame_results,
             optimization_root=optimization_root,
             optimized_name=config.optimized_name,
+            max_edge_copy_span=config.max_edge_recovery_copy_span,
         ) if config.recover_bad_frames else [
             (load_npy_dict(fr.optimized_npy) if fr.optimized_npy is not None and fr.optimized_npy.exists() else None)
             for fr in frame_results

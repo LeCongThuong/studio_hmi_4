@@ -122,6 +122,10 @@ class OptimizationConfig:
     min_valid_points: int = 6
     zero_weight_strategy: str = "uniform_finite"
     freeze_lower_body: bool = False
+    init_prev_sim_scale: Optional[float] = None
+    init_prev_sim_R: Optional[np.ndarray] = None
+    init_prev_sim_t: Optional[np.ndarray] = None
+    reuse_prev_similarity_when_freeze_lower_body: bool = True
 
 
 @dataclass
@@ -140,6 +144,9 @@ class OptimizationRunResult:
     used_temporal_init: bool
     is_bad_loss: bool
     best_pose: np.ndarray
+    sim_scale: float
+    sim_R: np.ndarray
+    sim_t: np.ndarray
 
 
 @dataclass
@@ -802,13 +809,13 @@ def run_optimization(
 
     init_dict = view_dicts[best_cam]
 
-    init_pose = to_torch(init_dict["body_pose_params"], device).flatten().to(torch.float32)
+    init_pose_raw = to_torch(init_dict["body_pose_params"], device).flatten().to(torch.float32)
     init_hand = get_param_array(init_dict, "hand_pose_params", device)
     init_scale = get_param_array(init_dict, "scale_params", device)
     init_shape = get_param_array(init_dict, "shape_params", device)
     init_expr = get_param_array(init_dict, "expr_params", device)
 
-    pose_dim = int(init_pose.numel())
+    pose_dim = int(init_pose_raw.numel())
     if int(runtime_keep_mask.numel()) == pose_dim:
         base_keep_mask = runtime_keep_mask.to(device=device, dtype=torch.float32)
     else:
@@ -825,7 +832,8 @@ def run_optimization(
             lower_idxs_t = torch.from_numpy(lower_idxs_np).to(device=device, dtype=torch.long)
             optimize_mask[lower_idxs_t] = 0.0
 
-    init_pose = init_pose * optimize_mask
+    init_pose_ref = init_pose_raw.clone()
+    frozen_pose_target = init_pose_raw.clone()
     temporal_prev_np = config.init_prev_body_pose
     if temporal_prev_np is None:
         # Backward-compatibility for existing callers.
@@ -838,19 +846,33 @@ def run_optimization(
     used_temporal_init = temporal_prev_np is not None
     if temporal_prev_np is not None:
         temporal_pose = to_torch(temporal_prev_np, device).flatten().to(torch.float32)
-        temporal_pose = temporal_pose * optimize_mask
+        if int(temporal_pose.numel()) != pose_dim:
+            raise ValueError(
+                f"Temporal pose dim mismatch: expected {pose_dim}, got {int(temporal_pose.numel())}"
+            )
         init_target = temporal_pose
         if temporal_prev_prev_np is not None:
             temporal_prev_prev_pose = to_torch(temporal_prev_prev_np, device).flatten().to(torch.float32)
-            temporal_prev_prev_pose = temporal_prev_prev_pose * optimize_mask
+            if int(temporal_prev_prev_pose.numel()) != pose_dim:
+                raise ValueError(
+                    "Temporal prev-prev pose dim mismatch: "
+                    f"expected {pose_dim}, got {int(temporal_prev_prev_pose.numel())}"
+                )
             extrap = float(np.clip(config.temporal_extrapolation, 0.0, 2.0))
             temporal_velocity_target = temporal_pose + extrap * (temporal_pose - temporal_prev_prev_pose)
             init_target = temporal_velocity_target
         blend = float(np.clip(config.temporal_init_blend, 0.0, 1.0))
-        init_pose = (1.0 - blend) * init_pose + blend * init_target
+        blend_mask = optimize_mask * blend
+        init_pose_ref = init_pose_ref * (1.0 - blend_mask) + init_target * blend_mask
+        if config.freeze_lower_body:
+            frozen_pose_target = torch.where(
+                optimize_mask == 0,
+                temporal_pose,
+                frozen_pose_target,
+            )
 
     # ---- Optimize pose (leaf tensor) ----
-    pose = init_pose.clone().detach().requires_grad_(True)
+    pose = init_pose_ref.clone().detach().requires_grad_(True)
     opt = torch.optim.Adam([pose], lr=config.lr)
 
     loss_hist: List[float] = []
@@ -859,7 +881,7 @@ def run_optimization(
     # debug init plot
     if config.save_debug_artifacts:
         with torch.no_grad():
-            pose_eff0 = pose.detach() * optimize_mask + init_pose * (1.0 - optimize_mask)
+            pose_eff0 = pose.detach() * optimize_mask + frozen_pose_target * (1.0 - optimize_mask)
             out0 = mhr_fk(head, pose_eff0, init_hand, init_scale, init_shape, init_expr, device,
                           want_verts=False, want_joint=False, want_model_params=False)
             k70_0 = apply_repo_camera_flip_xyz(out0[1].squeeze(0)[:70])
@@ -896,7 +918,7 @@ def run_optimization(
     for it in range(config.iters):
         opt.zero_grad(set_to_none=True)
 
-        pose_eff = pose * optimize_mask + init_pose * (1.0 - optimize_mask)
+        pose_eff = pose * optimize_mask + frozen_pose_target * (1.0 - optimize_mask)
 
         out = mhr_fk(head, pose_eff, init_hand, init_scale, init_shape, init_expr, device,
                      want_verts=False, want_joint=False, want_model_params=False)
@@ -923,7 +945,7 @@ def run_optimization(
         r = torch.sqrt((diff * diff).sum(dim=1) + 1e-12)
 
         loss_data = (wM_v * huber(r, delta=config.huber_m)).sum() / (wM_v.sum() + 1e-9)
-        loss_reg = config.w_pose_reg * torch.mean((pose - init_pose) ** 2)
+        loss_reg = config.w_pose_reg * torch.mean((pose - init_pose_ref) ** 2)
         if temporal_pose is not None and config.w_temporal > 0:
             loss_temporal = config.w_temporal * torch.mean((pose - temporal_pose) ** 2)
         else:
@@ -954,7 +976,7 @@ def run_optimization(
         opt.step()
 
         with torch.no_grad():
-            pose.copy_(pose * optimize_mask + init_pose * (1.0 - optimize_mask))
+            pose.copy_(pose * optimize_mask + frozen_pose_target * (1.0 - optimize_mask))
 
         loss_hist.append(float(loss.detach().cpu().item()))
         data_loss_hist.append(float(loss_data.detach().cpu().item()))
@@ -993,14 +1015,18 @@ def run_optimization(
     if best_iter >= 0:
         with torch.no_grad():
             pose.copy_(best_pose)
-            pose.copy_(pose * optimize_mask + init_pose * (1.0 - optimize_mask))
+            pose.copy_(pose * optimize_mask + frozen_pose_target * (1.0 - optimize_mask))
 
     if config.save_debug_artifacts:
         plot_loss_curve(loss_hist, debug_dir / "loss_curve.png")
 
+    output_sim_scale = 1.0
+    output_sim_R = np.eye(3, dtype=np.float32)
+    output_sim_t = np.zeros(3, dtype=np.float32)
+
     # final forward (full outputs)
     with torch.no_grad():
-        pose_eff = pose.detach() * optimize_mask + init_pose * (1.0 - optimize_mask)
+        pose_eff = pose.detach() * optimize_mask + frozen_pose_target * (1.0 - optimize_mask)
         outF = mhr_fk(head, pose_eff, init_hand, init_scale, init_shape, init_expr, device,
                       want_verts=True, want_joint=True, want_model_params=True)
 
@@ -1025,19 +1051,36 @@ def run_optimization(
         gtM_v = gtM_t.index_select(0, valid_idx_t)
         wM_v = wM_masked_t.index_select(0, valid_idx_t)
 
-        s, R, t = umeyama_similarity(predM_v, gtM_v, w=wM_v, with_scale=config.with_scale)
+        fit_s, fit_R, fit_t = umeyama_similarity(predM_v, gtM_v, w=wM_v, with_scale=config.with_scale)
+        out_s, out_R, out_t = fit_s, fit_R, fit_t
+        reused_prev_similarity = False
+        if (
+            config.freeze_lower_body
+            and config.reuse_prev_similarity_when_freeze_lower_body
+            and config.init_prev_sim_scale is not None
+            and config.init_prev_sim_R is not None
+            and config.init_prev_sim_t is not None
+        ):
+            prev_R = np.asarray(config.init_prev_sim_R, dtype=np.float32).reshape(3, 3)
+            prev_t = np.asarray(config.init_prev_sim_t, dtype=np.float32).reshape(3)
+            prev_s = float(config.init_prev_sim_scale)
+            if np.isfinite(prev_s) and np.isfinite(prev_R).all() and np.isfinite(prev_t).all():
+                out_s = to_torch(prev_s, device)
+                out_R = to_torch(prev_R, device)
+                out_t = to_torch(prev_t, device)
+                reused_prev_similarity = True
 
-        k70_aligned = s * (k70 @ R.T) + t[None, :]
-        verts_aligned = s * (verts @ R.T) + t[None, :]
-        jcoords_aligned = s * (jcoords @ R.T) + t[None, :]
-        jrots_aligned = R[None, :, :] @ jrots  # optional consistency
+        k70_aligned = out_s * (k70 @ out_R.T) + out_t[None, :]
+        verts_aligned = out_s * (verts @ out_R.T) + out_t[None, :]
+        jcoords_aligned = out_s * (jcoords @ out_R.T) + out_t[None, :]
+        jrots_aligned = out_R[None, :, :] @ jrots  # optional consistency
 
-        predM_aligned_v = s * (predM_v @ R.T) + t[None, :]
+        predM_aligned_v = fit_s * (predM_v @ fit_R.T) + fit_t[None, :]
         residual_subset = torch.sqrt(((predM_aligned_v - gtM_v) ** 2).sum(dim=1) + 1e-12)
         aligned_data_loss = (wM_v * huber(residual_subset, delta=config.huber_m)).sum() / (wM_v.sum() + 1e-9)
         final_data_loss = float(aligned_data_loss.detach().cpu().item())
         best_data_loss = min(best_data_loss, final_data_loss)
-        final_reg_loss = float((config.w_pose_reg * torch.mean((pose - init_pose) ** 2)).detach().cpu().item())
+        final_reg_loss = float((config.w_pose_reg * torch.mean((pose - init_pose_ref) ** 2)).detach().cpu().item())
         if temporal_pose is not None and config.w_temporal > 0:
             final_temporal = float(
                 (config.w_temporal * torch.mean((pose - temporal_pose) ** 2)).detach().cpu().item()
@@ -1104,9 +1147,13 @@ def run_optimization(
                 w_subset=wM_np,
                 init_scores_3d_m=np.array([view_scores_3d[c] for c in cams], dtype=np.float32),
                 init_scores_mean_px=np.array([view_mean_px[c] for c in cams], dtype=np.float32),
-                final_scale=np.array(float(s.cpu().item()), dtype=np.float32),
-                final_R=R.cpu().numpy(),
-                final_t=t.cpu().numpy(),
+                final_scale=np.array(float(out_s.cpu().item()), dtype=np.float32),
+                final_R=out_R.cpu().numpy(),
+                final_t=out_t.cpu().numpy(),
+                final_scale_fit=np.array(float(fit_s.cpu().item()), dtype=np.float32),
+                final_R_fit=fit_R.cpu().numpy(),
+                final_t_fit=fit_t.cpu().numpy(),
+                reused_prev_similarity=np.array(int(reused_prev_similarity), dtype=np.int32),
                 loss_hist=np.array(loss_hist, dtype=np.float32),
                 data_loss_hist=np.array(data_loss_hist, dtype=np.float32),
                 best_loss=np.array(best_loss, dtype=np.float32),
@@ -1131,9 +1178,13 @@ def run_optimization(
         out_dict["opt_init_cam"] = best_cam
         out_dict["opt_cam_scores_3d_m"] = view_scores_3d
         out_dict["opt_cam_mean_err_px_refined"] = view_mean_px
-        out_dict["opt_sim_scale"] = float(s.cpu().item())
-        out_dict["opt_sim_R"] = R.cpu().numpy()
-        out_dict["opt_sim_t"] = t.cpu().numpy()
+        out_dict["opt_sim_scale"] = float(out_s.cpu().item())
+        out_dict["opt_sim_R"] = out_R.cpu().numpy()
+        out_dict["opt_sim_t"] = out_t.cpu().numpy()
+        out_dict["opt_sim_scale_fit"] = float(fit_s.cpu().item())
+        out_dict["opt_sim_R_fit"] = fit_R.cpu().numpy()
+        out_dict["opt_sim_t_fit"] = fit_t.cpu().numpy()
+        out_dict["opt_sim_reused_prev"] = int(reused_prev_similarity)
         out_dict["opt_loss_hist"] = np.array(loss_hist, dtype=np.float32)
         out_dict["opt_data_loss_hist"] = np.array(data_loss_hist, dtype=np.float32)
         out_dict["opt_best_loss"] = float(best_loss)
@@ -1163,6 +1214,9 @@ def run_optimization(
         out_dict["opt_is_bad_loss"] = int(is_bad_loss)
 
         np.save(out_npy, out_dict, allow_pickle=True)
+        output_sim_scale = float(out_s.cpu().item())
+        output_sim_R = out_R.cpu().numpy().astype(np.float32)
+        output_sim_t = out_t.cpu().numpy().astype(np.float32)
 
     print(f"\nSaved optimized npy: {out_npy}")
     print(
@@ -1193,7 +1247,10 @@ def run_optimization(
         best_iter=int(best_iter),
         used_temporal_init=bool(used_temporal_init),
         is_bad_loss=is_bad_loss,
-        best_pose=(pose.detach() * optimize_mask + init_pose * (1.0 - optimize_mask)).cpu().numpy().astype(np.float32),
+        best_pose=(pose.detach() * optimize_mask + frozen_pose_target * (1.0 - optimize_mask)).cpu().numpy().astype(np.float32),
+        sim_scale=output_sim_scale,
+        sim_R=output_sim_R,
+        sim_t=output_sim_t,
     )
 
 
