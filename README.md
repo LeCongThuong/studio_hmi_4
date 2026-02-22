@@ -62,6 +62,7 @@ python run_full_pipeline.py \
 - `--bad_frame_max_retries 2`: retry bad frames with stronger temporal constraints.
 - `--max_stale_temporal_frames 40`: disable temporal priors after long non-good streaks to avoid stale-pose lock-in.
 - `--max_edge_recovery_copy_span 15`: cap one-sided recovery copy distance so long bad tails are not flattened to one repeated pose.
+- `--fixed_mhr_param_frame_idx <idx> --fixed_mhr_param_cam front`: lock non-pose MHR params (`hand/scale/shape/expr`) to one reference frame+camera across the sequence (useful for single-person videos to avoid body-size drift).
 - Reused optimization files that were recovered now keep a recovered status in summaries (not `ok`) and no longer report copied loss metrics as if they were fresh optimization results.
 - `--min_valid_points 6 --zero_weight_strategy uniform_finite`: robust stage-3 valid-point/weight controls.
 - `--freeze_lower_body`: lock lower-body dimensions and (for sequence runs) reuse previous-frame similarity alignment for lower-body world stability.

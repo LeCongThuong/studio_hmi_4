@@ -126,6 +126,10 @@ class OptimizationConfig:
     init_prev_sim_R: Optional[np.ndarray] = None
     init_prev_sim_t: Optional[np.ndarray] = None
     reuse_prev_similarity_when_freeze_lower_body: bool = True
+    fixed_hand_pose_params: Optional[np.ndarray] = None
+    fixed_scale_params: Optional[np.ndarray] = None
+    fixed_shape_params: Optional[np.ndarray] = None
+    fixed_expr_params: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -815,6 +819,39 @@ def run_optimization(
     init_shape = get_param_array(init_dict, "shape_params", device)
     init_expr = get_param_array(init_dict, "expr_params", device)
 
+    if config.fixed_hand_pose_params is not None:
+        fixed_hand = to_torch(config.fixed_hand_pose_params, device).flatten().to(torch.float32)
+        if int(fixed_hand.numel()) != int(init_hand.numel()):
+            raise ValueError(
+                "fixed_hand_pose_params dim mismatch: "
+                f"expected {int(init_hand.numel())}, got {int(fixed_hand.numel())}"
+            )
+        init_hand = fixed_hand
+    if config.fixed_scale_params is not None:
+        fixed_scale = to_torch(config.fixed_scale_params, device).flatten().to(torch.float32)
+        if int(fixed_scale.numel()) != int(init_scale.numel()):
+            raise ValueError(
+                "fixed_scale_params dim mismatch: "
+                f"expected {int(init_scale.numel())}, got {int(fixed_scale.numel())}"
+            )
+        init_scale = fixed_scale
+    if config.fixed_shape_params is not None:
+        fixed_shape = to_torch(config.fixed_shape_params, device).flatten().to(torch.float32)
+        if int(fixed_shape.numel()) != int(init_shape.numel()):
+            raise ValueError(
+                "fixed_shape_params dim mismatch: "
+                f"expected {int(init_shape.numel())}, got {int(fixed_shape.numel())}"
+            )
+        init_shape = fixed_shape
+    if config.fixed_expr_params is not None:
+        fixed_expr = to_torch(config.fixed_expr_params, device).flatten().to(torch.float32)
+        if int(fixed_expr.numel()) != int(init_expr.numel()):
+            raise ValueError(
+                "fixed_expr_params dim mismatch: "
+                f"expected {int(init_expr.numel())}, got {int(fixed_expr.numel())}"
+            )
+        init_expr = fixed_expr
+
     pose_dim = int(init_pose_raw.numel())
     if int(runtime_keep_mask.numel()) == pose_dim:
         base_keep_mask = runtime_keep_mask.to(device=device, dtype=torch.float32)
@@ -1203,6 +1240,10 @@ def run_optimization(
         out_dict["opt_temporal_extrapolation"] = float(config.temporal_extrapolation)
         out_dict["opt_subset_indices"] = subset_idx
         out_dict["opt_points3d_refined"] = gtM
+        out_dict["opt_fixed_hand_pose_params"] = int(config.fixed_hand_pose_params is not None)
+        out_dict["opt_fixed_scale_params"] = int(config.fixed_scale_params is not None)
+        out_dict["opt_fixed_shape_params"] = int(config.fixed_shape_params is not None)
+        out_dict["opt_fixed_expr_params"] = int(config.fixed_expr_params is not None)
 
         is_bad_loss = classify_bad_optimization(
             config=config,

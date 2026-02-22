@@ -105,6 +105,8 @@ class FullPipelineConfig:
     w_temporal_accel: float = 5e-4
     temporal_init_blend: float = 0.7
     temporal_extrapolation: float = 1.0
+    fixed_mhr_param_frame_idx: Optional[int] = None
+    fixed_mhr_param_cam: str = "front"
     bad_loss_threshold: float = 3e-5
     bad_data_loss_threshold: float = 2e-5
     bad_loss_growth_ratio: float = 1.5
@@ -389,6 +391,44 @@ def _safe_scalar_int(d: Dict[str, Any], key: str) -> Optional[int]:
         return int(np.asarray(d[key]).reshape(()))
     except Exception:
         return None
+
+
+def _load_fixed_non_pose_mhr_params(
+    npy_dir: Path,
+    cam: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    npy_path = find_existing_with_exts(npy_dir, cam, NP_EXTS)
+    if npy_path is None:
+        raise FileNotFoundError(
+            f"Could not find fixed-parameter source file for cam='{cam}' in {npy_dir}"
+        )
+    d = load_npy_dict(npy_path)
+    required = (
+        "hand_pose_params",
+        "scale_params",
+        "shape_params",
+        "expr_params",
+    )
+    missing = [k for k in required if k not in d]
+    if missing:
+        raise KeyError(
+            "Fixed-parameter source is missing required keys: "
+            + ", ".join(missing)
+            + f" (file: {npy_path})"
+        )
+    hand = np.asarray(d["hand_pose_params"], dtype=np.float32).reshape(-1)
+    scale = np.asarray(d["scale_params"], dtype=np.float32).reshape(-1)
+    shape = np.asarray(d["shape_params"], dtype=np.float32).reshape(-1)
+    expr = np.asarray(d["expr_params"], dtype=np.float32).reshape(-1)
+    if not np.isfinite(hand).all():
+        raise ValueError(f"Non-finite hand_pose_params in fixed source: {npy_path}")
+    if not np.isfinite(scale).all():
+        raise ValueError(f"Non-finite scale_params in fixed source: {npy_path}")
+    if not np.isfinite(shape).all():
+        raise ValueError(f"Non-finite shape_params in fixed source: {npy_path}")
+    if not np.isfinite(expr).all():
+        raise ValueError(f"Non-finite expr_params in fixed source: {npy_path}")
+    return hand, scale, shape, expr
 
 
 def _push_temporal_pose_history(
@@ -678,6 +718,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--w_temporal_accel", type=float, default=5e-4)
     ap.add_argument("--temporal_init_blend", type=float, default=0.7)
     ap.add_argument("--temporal_extrapolation", type=float, default=1.0)
+    ap.add_argument(
+        "--fixed_mhr_param_frame_idx",
+        type=int,
+        default=None,
+        help=(
+            "Optional frame index used as fixed source for non-pose MHR params "
+            "(hand/scale/shape/expr) across the whole sequence."
+        ),
+    )
+    ap.add_argument(
+        "--fixed_mhr_param_cam",
+        type=str,
+        default="front",
+        help=(
+            "Camera name used to read fixed non-pose MHR params from "
+            "--fixed_mhr_param_frame_idx."
+        ),
+    )
     ap.add_argument("--bad_loss_threshold", type=float, default=3e-5)
     ap.add_argument("--bad_data_loss_threshold", type=float, default=2e-5)
     ap.add_argument("--bad_loss_growth_ratio", type=float, default=1.5)
@@ -809,6 +867,8 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
         w_temporal_accel=float(getattr(args, "w_temporal_accel", 5e-4)),
         temporal_init_blend=float(getattr(args, "temporal_init_blend", 0.7)),
         temporal_extrapolation=float(getattr(args, "temporal_extrapolation", 1.0)),
+        fixed_mhr_param_frame_idx=getattr(args, "fixed_mhr_param_frame_idx", None),
+        fixed_mhr_param_cam=str(getattr(args, "fixed_mhr_param_cam", "front")),
         bad_loss_threshold=float(getattr(args, "bad_loss_threshold", 3e-5)),
         bad_data_loss_threshold=float(getattr(args, "bad_data_loss_threshold", 2e-5)),
         bad_loss_growth_ratio=float(getattr(args, "bad_loss_growth_ratio", 1.5)),
@@ -924,6 +984,47 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
     if not frame_inputs:
         raise FileNotFoundError(
             f"No frame directories with camera predictions {config.cams} found under {npy_root}"
+        )
+
+    fixed_hand_params: Optional[np.ndarray] = None
+    fixed_scale_params: Optional[np.ndarray] = None
+    fixed_shape_params: Optional[np.ndarray] = None
+    fixed_expr_params: Optional[np.ndarray] = None
+    if config.fixed_mhr_param_frame_idx is not None:
+        ref_idx = int(config.fixed_mhr_param_frame_idx)
+        ref_entry = next(
+            (
+                e
+                for e in frame_inputs
+                if e.frame_index is not None and int(e.frame_index) == ref_idx and e.npy_dir is not None
+            ),
+            None,
+        )
+        if ref_entry is None:
+            raise FileNotFoundError(
+                f"Could not find frame index {ref_idx} with available npy inputs for "
+                "--fixed_mhr_param_frame_idx."
+            )
+        ref_npy_dir = ref_entry.npy_dir
+        if ref_npy_dir is None:
+            raise FileNotFoundError(
+                f"Reference frame index {ref_idx} has no npy_dir."
+            )
+        fixed_cam = str(config.fixed_mhr_param_cam).strip()
+        if fixed_cam == "":
+            raise ValueError("--fixed_mhr_param_cam cannot be empty.")
+        (
+            fixed_hand_params,
+            fixed_scale_params,
+            fixed_shape_params,
+            fixed_expr_params,
+        ) = _load_fixed_non_pose_mhr_params(
+            npy_dir=ref_npy_dir,
+            cam=fixed_cam,
+        )
+        print(
+            "[PIPELINE] Using fixed non-pose MHR params from "
+            f"frame_index={ref_idx} rel='{ref_entry.rel_dir or '.'}' cam='{fixed_cam}'."
         )
 
     total_frames = len(frame_inputs)
@@ -1179,6 +1280,10 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                 init_prev_sim_scale=init_prev_sim_scale,
                 init_prev_sim_R=init_prev_sim_R,
                 init_prev_sim_t=init_prev_sim_t,
+                fixed_hand_pose_params=None if fixed_hand_params is None else fixed_hand_params.copy(),
+                fixed_scale_params=None if fixed_scale_params is None else fixed_scale_params.copy(),
+                fixed_shape_params=None if fixed_shape_params is None else fixed_shape_params.copy(),
+                fixed_expr_params=None if fixed_expr_params is None else fixed_expr_params.copy(),
                 bad_loss_threshold=config.bad_loss_threshold,
                 bad_data_loss_threshold=config.bad_data_loss_threshold,
                 bad_loss_growth_ratio=config.bad_loss_growth_ratio,
@@ -1245,6 +1350,10 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                         init_prev_sim_scale=prev_good_sim_scale,
                         init_prev_sim_R=None if prev_good_sim_R is None else prev_good_sim_R.copy(),
                         init_prev_sim_t=None if prev_good_sim_t is None else prev_good_sim_t.copy(),
+                        fixed_hand_pose_params=None if fixed_hand_params is None else fixed_hand_params.copy(),
+                        fixed_scale_params=None if fixed_scale_params is None else fixed_scale_params.copy(),
+                        fixed_shape_params=None if fixed_shape_params is None else fixed_shape_params.copy(),
+                        fixed_expr_params=None if fixed_expr_params is None else fixed_expr_params.copy(),
                         bad_loss_threshold=config.bad_loss_threshold,
                         bad_data_loss_threshold=config.bad_data_loss_threshold,
                         bad_loss_growth_ratio=config.bad_loss_growth_ratio,
