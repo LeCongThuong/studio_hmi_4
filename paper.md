@@ -4,18 +4,17 @@
 \usepackage[T1]{fontenc}
 \usepackage[utf8]{inputenc}
 \usepackage{lmodern}
-\usepackage{amsmath,amssymb,amsthm,bm}
+\usepackage{amsmath,amssymb,bm}
 \usepackage{booktabs}
 \usepackage{siunitx}
 \usepackage{graphicx}
-\usepackage{url}
 \usepackage[hidelinks]{hyperref}
 \usepackage{enumitem}
 \usepackage{algorithm}
 \usepackage{algpseudocode}
-\usepackage{array}
 
-\title{A Robust Three-Stage Multi-View Human Reconstruction Framework}
+\title{From Pixels to Rig-Consistent 3D Humans:\\
+A Three-Component Multi-View Framework}
 \author{Technical Report}
 \date{\today}
 
@@ -23,197 +22,149 @@
 \maketitle
 
 \begin{abstract}
-This paper presents a robust framework for multi-view human reconstruction from synchronized image streams.
-The method is decomposed into three stages: per-view perception, multi-view geometric consensus, and rig-constrained optimization.
-The central contribution is reliability under long sequences: strict quality gates, bounded temporal priors, explicit bad-frame handling, and transparent sequence-level status accounting.
-We describe the formulation, architecture, and operational safeguards in a form suitable for both research and deployment.
+This paper presents a focused three-component framework for multi-view 3D human reconstruction.
+The method progresses from per-view pixel understanding, to robust geometric fusion across cameras, and finally to rig-constrained optimization for anatomically coherent 3D outputs.
+We emphasize the central modeling choices that govern quality: robust residual design, confidence-weighted supervision, similarity alignment, and separation of dynamic pose from static identity attributes.
 \end{abstract}
 
 \section{Introduction}
-Human reconstruction in multi-camera settings remains difficult due to partial visibility, inconsistent detections, calibration sensitivity, and temporal instability.
-Monolithic approaches often obscure error origins and make corrective actions difficult.
-We address this with a staged design:
+Multi-view human reconstruction can be viewed as a sequence of progressively stronger representations: pixels provide raw evidence, per-view inference provides semantic structure, triangulation produces cross-view 3D consensus, and rig optimization enforces physically plausible articulation.
+This document keeps the presentation centered on those three components and their mathematical connection.
+
+\section{Component I: Pixel-to-Perceptual Inference}
+For each frame $t$ and camera $v$, an inference model maps the input image $I_t^{(v)}$ to structured outputs,
+\begin{equation}
+\mathbf{z}_t^{(v)} = f_{\theta}(I_t^{(v)}),
+\end{equation}
+where $\mathbf{z}_t^{(v)}$ contains 2D landmarks $\mathbf{u}_{t}^{(v)} \in \mathbb{R}^{K\times2}$, coarse 3D landmarks $\tilde{\mathbf{X}}_{t}^{(v)} \in \mathbb{R}^{K\times3}$, and latent rig parameters.
+The key role of this stage is representational: it converts appearance into semantically aligned human structure that can later be fused geometrically.
+These predictions are not final geometry; they are view-specific hypotheses carrying both signal and uncertainty.
+
+\section{Component II: Multi-View Triangulation}
+Given calibrated cameras and per-view observations $\mathbf{u}_{j,t}^{(v)}$ for landmark $j$, geometric supervision is obtained by robust reprojection minimization:
+\begin{equation}
+\mathbf{X}_{j,t}^{*}
+=
+\arg\min_{\mathbf{X}}
+\sum_{v \in \mathcal{V}_{j,t}}
+\rho\!\left(
+\left\|
+\mathbf{u}_{j,t}^{(v)} - \pi_v(\mathbf{X})
+\right\|_2
+\right),
+\end{equation}
+where $\pi_v(\cdot)$ is the calibrated projection model and $\rho(\cdot)$ is a robust penalty.
+Robustness is essential because a small number of 2D outliers can otherwise dominate the solution.
+
+In practice, each landmark is estimated through a formal four-step procedure:
 \begin{enumerate}[leftmargin=1.2em]
-    \item \textbf{Stage A (Perception)}: produce per-view human hypotheses.
-    \item \textbf{Stage B (Geometry)}: triangulate and refine a reliable 3D supervision subset.
-    \item \textbf{Stage C (Rig Fitting)}: optimize rig parameters against geometric supervision.
+    \item generate candidate 3D points by pairwise linear triangulation over view pairs,
+    \item score candidates by cross-view robust reprojection residuals and select the best candidate,
+    \item infer inlier views using thresholded residuals,
+    \item run nonlinear refinement (damped least-squares) on the inlier set.
 \end{enumerate}
-Each stage has a clear contract and explicit diagnostics, enabling targeted debugging and stable sequence behavior.
-
-\section{System Formulation}
-\subsection{Input}
-At each time index $t$, the system receives images from a subset of cameras:
+The inlier set is defined as
 \begin{equation}
-\mathcal{I}_t = \{I_t^{(v)} \mid v \in \mathcal{V}_t\}, \quad |\mathcal{V}_t| \ge 2 \text{ when valid}.
+\mathcal{I}_{j,t}
+=
+\left\{
+ v \in \mathcal{V}_{j,t}
+\;\middle|\;
+\left\|
+\mathbf{u}_{j,t}^{(v)} - \pi_v(\mathbf{X}_{j,t}^{\mathrm{init}})
+\right\|_2 < \tau
+\right\},
 \end{equation}
-Camera calibration provides intrinsics and extrinsics for each view.
-
-\subsection{Output}
-For each valid frame, the system estimates:
-\begin{itemize}[leftmargin=1.2em]
-    \item 3D keypoints in a consistent coordinate frame,
-    \item rig-consistent pose parameters,
-    \item optional mesh-level geometry,
-    \item quality metadata and status labels.
-\end{itemize}
-
-\section{Stage A: Per-View Perception}
-\subsection{Role}
-Stage A converts raw pixels into structured human predictions per camera.
-Typical outputs include 2D keypoints, coarse 3D keypoints, joint geometry, and latent rig parameters.
-
-\subsection{Multi-Person Disambiguation}
-When multiple people are detected, a selection policy is applied (e.g., first candidate, largest area, or fixed index) to maintain a single, consistent subject for downstream stages.
-
-\subsection{Contract Quality}
-This stage is designed to be reusable with metadata checks to avoid stale-cache contamination between runs with different settings.
-
-\section{Stage B: Multi-View Geometric Consensus}
-\subsection{Subset Strategy}
-Instead of triangulating every landmark equally, the method prioritizes a subset with high geometric utility and cross-view consistency.
-This reduces sensitivity to noisy or weakly observed points.
-
-\subsection{Per-Point Robust Triangulation}
-For each selected landmark:
-\begin{enumerate}[leftmargin=1.2em]
-    \item generate pairwise triangulation candidates,
-    \item score candidates by robust reprojection statistics across views,
-    \item infer inlier view set by thresholding reprojection error,
-    \item refine 3D point by iterative nonlinear optimization.
-\end{enumerate}
-
-\subsection{Failure-Tolerant Behavior}
-If a landmark is under-constrained in a frame, it may remain invalid.
-Downstream optimization is therefore designed to explicitly handle non-finite or low-confidence geometric targets.
-
-\section{Stage C: Rig-Constrained Optimization}
-\subsection{Initialization}
-Each view hypothesis provides a candidate initialization.
-Initialization quality is ranked by a weighted similarity alignment score to Stage B supervision.
-
-\subsection{Similarity Alignment}
-Given predicted subset points $\mathbf{X}$ and target points $\mathbf{Y}$, we solve:
+and refinement solves
 \begin{equation}
-\mathbf{Y} \approx s (\mathbf{X}\mathbf{R}^{\top}) + \mathbf{t},
+\mathbf{X}_{j,t}^{*}
+=
+\arg\min_{\mathbf{X}}
+\sum_{v \in \mathcal{I}_{j,t}}
+ w_{j,t}^{(v)}
+\left\|
+\mathbf{u}_{j,t}^{(v)} - \pi_v(\mathbf{X})
+\right\|_2^2.
 \end{equation}
-with optional scale, where $(s,\mathbf{R},\mathbf{t})$ is estimated by weighted Procrustes/Umeyama alignment.
+The resulting refined set $\{\mathbf{X}_{j,t}^{*}\}$ provides pseudo-ground-truth supervision for rig fitting, while weights $w_{j,t}^{(v)}$ reduce the impact of weak observations.
 
-\subsection{Objective}
-Let $\mathbf{p}$ be pose parameters and $\mathcal{M}$ the valid supervised indices.
+\section{Component III: Rig-Constrained Optimization}
+Let the rig state be decomposed as
 \begin{equation}
-\mathcal{L}(\mathbf{p}) =
-\mathcal{L}_{\text{data}} +
-\lambda_{\text{reg}}\mathcal{L}_{\text{reg}} +
-\lambda_{\text{temp}}\mathcal{L}_{\text{temp}} +
-\lambda_{\text{vel}}\mathcal{L}_{\text{vel}} +
-\lambda_{\text{acc}}\mathcal{L}_{\text{acc}}.
+\bm{\theta}_t = (\mathbf{p}_t, \mathbf{a}_t),
 \end{equation}
-Data fidelity is weighted robust residual minimization:
+with dynamic pose parameters $\mathbf{p}_t$ and non-pose attributes $\mathbf{a}_t$ (shape, scale, and related identity factors).
+For a single subject, temporal consistency improves when non-pose attributes are fixed from a reference estimate,
 \begin{equation}
-\mathcal{L}_{\text{data}} =
-\frac{\sum_{i\in\mathcal{M}} w_i \,\rho_{\delta}\!\left(\|\hat{\mathbf{y}}_i(\mathbf{p})-\mathbf{y}_i\|_2\right)}
-{\sum_{i\in\mathcal{M}} w_i + \epsilon}.
+\mathbf{a}_t \equiv \mathbf{a}_{\text{ref}},
 \end{equation}
+so articulation changes over time while identity remains stable.
 
-\subsection{Hard Parameter Freezing}
-Given binary mask $\mathbf{m}$ and frozen target $\mathbf{p}_f$:
+Given a rig forward model $\mathcal{F}$, predicted supervision landmarks are
 \begin{equation}
-\mathbf{p}_{\text{eff}} = \mathbf{p}\odot\mathbf{m} + \mathbf{p}_f\odot(1-\mathbf{m}).
+\hat{\mathbf{Y}}_{t,m} = \mathcal{F}_m(\mathbf{p}_t, \mathbf{a}_t), \quad m\in\mathcal{M}.
 \end{equation}
-Frozen dimensions receive zero gradient and are clamped after each update, enforcing strict invariance.
+Before residual evaluation, predictions are aligned to triangulated targets with a weighted similarity transform,
+\begin{equation}
+\bar{\mathbf{Y}}_{t,m} = s_t \mathbf{R}_t \hat{\mathbf{Y}}_{t,m} + \mathbf{t}_t,
+\end{equation}
+which separates global rigid mismatch from local articulation error and improves optimization conditioning.
 
-\section{Sequence Reliability Architecture}
-\subsection{Quality Gates}
-Each frame is classified as acceptable or bad using thresholds on:
-\begin{itemize}[leftmargin=1.2em]
-    \item best objective level,
-    \item best data-fit level,
-    \item final-to-best degradation ratio.
-\end{itemize}
+The per-frame objective is
+\begin{equation}
+\mathcal{L}_t
+=
+\mathcal{L}_{\text{data},t}
++ \lambda_{\text{reg}}\mathcal{L}_{\text{reg},t}
++ \lambda_{\text{temp}}\mathcal{L}_{\text{temp},t}
++ \lambda_{\text{vel}}\mathcal{L}_{\text{vel},t},
+\end{equation}
+with data term
+\begin{equation}
+\mathcal{L}_{\text{data},t}
+=
+\frac{
+\sum_{m\in\mathcal{M}} w_{t,m}\,
+\rho_{\delta}\!\left(
+\|\bar{\mathbf{Y}}_{t,m} - \mathbf{Y}_{t,m}\|_2
+\right)}
+{\sum_{m\in\mathcal{M}} w_{t,m} + \epsilon}.
+\end{equation}
+Regularization is defined by
+\begin{align}
+\mathcal{L}_{\text{reg},t} &= \|\mathbf{p}_t - \mathbf{p}_t^{0}\|_2^2, \\
+\mathcal{L}_{\text{temp},t} &= \|\mathbf{p}_t - \mathbf{p}_{t-1}\|_2^2, \\
+\mathcal{L}_{\text{vel},t} &= \|(\mathbf{p}_t-\mathbf{p}_{t-1})-(\mathbf{p}_{t-1}-\mathbf{p}_{t-2})\|_2^2.
+\end{align}
+Robust penalties limit outlier dominance, confidence weights modulate supervision reliability, and temporal terms suppress jitter while preserving motion continuity.
 
-\subsection{Retry Policy}
-Bad frames may be retried with stronger temporal regularization and conservative optimization dynamics.
+For constrained regions (e.g., lower body), hard masking can enforce fixed dimensions:
+\begin{equation}
+\mathbf{p}^{\text{eff}}_t
+=
+\mathbf{p}_t \odot \mathbf{m}
++
+\mathbf{p}^{\text{fix}}_t \odot (1-\mathbf{m}),
+\end{equation}
+where $\mathbf{m}\in\{0,1\}^d$ selects optimized entries and freezes the rest exactly.
 
-\subsection{Recovery Policy}
-If a frame remains unusable, recovery can be applied:
-\begin{itemize}[leftmargin=1.2em]
-    \item interpolation between valid neighbors when both sides exist,
-    \item bounded one-sided copy only within a strict span.
-\end{itemize}
-This prevents catastrophic long-tail flattening.
-
-\subsection{Temporal Safeguards}
-Temporal priors are disabled after prolonged non-good streaks to avoid stale-state lock-in.
-Recovered frames remain explicitly marked as recovered and are not misreported as fresh optimization success.
-
-\subsection{Optional Smoothing}
-Sequence post-processing can combine nearest valid fill, median filtering, robust outlier suppression, and bidirectional exponential smoothing.
-
-\section{High-Level Algorithm}
+\section{End-to-End View}
 \begin{algorithm}[h]
-\caption{Robust Multi-View Sequence Reconstruction}
+\caption{Three-Component Reconstruction}
 \begin{algorithmic}[1]
-\Require synchronized multi-view frames, calibration, model settings
-\For{each time index $t$}
-    \State run Stage A perception per available view
-    \State run Stage B robust triangulation and point refinement
-    \State run Stage C rig-constrained optimization
-    \If{quality gates fail}
-        \State apply retry policy
-    \EndIf
-    \State record frame status and quality metrics
+\Require synchronized multi-view images and camera calibration
+\For{each frame $t$}
+    \State infer per-view perceptual outputs
+    \State triangulate and refine supervised 3D landmarks
+    \State optimize rig parameters against triangulated targets
 \EndFor
-\State apply bounded recovery and optional smoothing
-\State export sequence summary statistics
+\State return temporally consistent 3D keypoints and mesh-level outputs
 \end{algorithmic}
 \end{algorithm}
 
-\section{Failure Modes and Mitigations}
-\subsection{Typical Failure Modes}
-\begin{enumerate}[leftmargin=1.2em]
-    \item non-finite geometric supervision,
-    \item collapsed confidence weights,
-    \item stale temporal priors dominating new evidence,
-    \item long-run copying that flattens motion,
-    \item misleading reporting when synthetic recovery is not separated from optimized output.
-\end{enumerate}
-
-\subsection{Mitigation Strategy}
-\begin{itemize}[leftmargin=1.2em]
-    \item strict stage contracts,
-    \item robust objective design,
-    \item bounded temporal influence,
-    \item explicit status semantics,
-    \item transparent sequence telemetry.
-\end{itemize}
-
-\section{Evaluation Protocol}
-\subsection{Core Metrics}
-\begin{itemize}[leftmargin=1.2em]
-    \item per-frame status distribution (success, bad, recovered, failed),
-    \item optimization quality statistics,
-    \item recovery footprint and span,
-    \item temporal stability indicators (jitter/drift).
-\end{itemize}
-
-\subsection{Recommended Ablations}
-\begin{itemize}[leftmargin=1.2em]
-    \item temporal priors off vs. on,
-    \item hard freeze off vs. on,
-    \item stale-prior guard off vs. on,
-    \item unbounded vs. bounded recovery span.
-\end{itemize}
-
-\section{Limitations}
-\begin{itemize}[leftmargin=1.2em]
-    \item dependence on calibration quality and camera synchronization,
-    \item subset-based supervision may under-constrain some body regions,
-    \item parameter sensitivity across different motion domains,
-    \item recovery remains a fallback, not a replacement for clean input.
-\end{itemize}
-
 \section{Conclusion}
-The presented framework delivers robust multi-view human reconstruction through modular decomposition and reliability-first sequence design.
-Its key value is not only geometric fidelity per frame, but controlled behavior across long sequences with transparent failure handling.
+The framework is a direct progression from pixels to perception, from perception to geometry, and from geometry to rig-consistent optimization.
+Triangulation provides robust 3D supervision, and the optimization objective converts that supervision into stable articulated motion with anatomical consistency.
+The key practical principle is to let pose vary over time while keeping identity-defining non-pose attributes fixed for a single person.
 
 \end{document}

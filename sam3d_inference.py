@@ -21,7 +21,7 @@ import shutil
 from dataclasses import dataclass
 from glob import glob
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import pyrootutils
 
@@ -57,6 +57,34 @@ MHR_PARAM_KEYS: Sequence[str] = (
     "expr_params",
 )
 
+# MANO/OpenPose(21) -> MHR70 right-hand indices.
+# Source mapping rationale is documented in hand_mapping.md.
+MANO_TO_MHR70_RIGHT = np.array(
+    [
+        41, 24, 23, 22, 21,
+        28, 27, 26, 25,
+        32, 31, 30, 29,
+        36, 35, 34, 33,
+        40, 39, 38, 37,
+    ],
+    dtype=np.int64,
+)
+
+# MANO/OpenPose(21) -> MHR70 left-hand indices.
+MANO_TO_MHR70_LEFT = np.array(
+    [
+        62, 45, 44, 43, 42,
+        49, 48, 47, 46,
+        53, 52, 51, 50,
+        57, 56, 55, 54,
+        61, 60, 59, 58,
+    ],
+    dtype=np.int64,
+)
+
+RIGHT_WRIST_MHR70_IDX = 41
+LEFT_WRIST_MHR70_IDX = 62
+
 
 @dataclass
 class Demo2Config:
@@ -79,6 +107,20 @@ class Demo2Config:
     include_rel_dirs: Optional[List[str]] = None
     person_select_strategy: str = "largest_bbox"
     person_index: int = 0
+    enable_specialized_hand_fusion: bool = False
+    specialized_hand_source: str = "precomputed"
+    specialized_hand_model: str = "none"
+    specialized_hand_input_root: str = ""
+    specialized_hand_device: str = "cuda"
+    specialized_hand_detector_conf: float = 0.3
+    specialized_hand_rescale_factor: float = 2.5
+    specialized_hand_wrist_max_dist_px: float = 140.0
+    replace_wrist_with_specialized: bool = False
+    specialized_hand_debug_vis: bool = False
+    specialized_hand_debug_dirname: str = "specialized_hand_debug"
+    specialized_hand_verbose: bool = False
+    wilor_pretrained_dir: str = ""
+    wilor_repo_id: str = "warmshao/WiLoR-mini"
 
 
 @dataclass
@@ -334,6 +376,414 @@ def _filter_images_by_rel_dirs(images: List[str], image_root: str, rel_dirs: Seq
     return filtered
 
 
+def _extract_k70_keypoints(
+    output_dict: Mapping[str, object],
+) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Return `(k70, original_array)` from `pred_keypoints_2d` if shape is compatible."""
+
+    if "pred_keypoints_2d" not in output_dict:
+        return None, None
+    arr = np.asarray(output_dict["pred_keypoints_2d"], dtype=np.float32)
+    if arr.ndim == 2 and arr.shape == (70, 2):
+        return arr.copy(), arr
+    if arr.ndim == 3 and arr.shape[-2:] == (70, 2):
+        return arr[0].copy(), arr
+    return None, arr
+
+
+def _write_back_k70_keypoints(
+    output_dict: Dict[str, object],
+    original_arr: np.ndarray,
+    k70: np.ndarray,
+) -> None:
+    k70 = np.asarray(k70, dtype=np.float32)
+    if original_arr.ndim == 2:
+        output_dict["pred_keypoints_2d"] = k70
+    elif original_arr.ndim == 3:
+        out = np.asarray(original_arr, dtype=np.float32).copy()
+        out[0] = k70
+        output_dict["pred_keypoints_2d"] = out
+
+
+def _build_specialized_hand_estimator(config: Demo2Config) -> Optional[Any]:
+    if not bool(config.enable_specialized_hand_fusion):
+        return None
+
+    source = str(config.specialized_hand_source).strip().lower()
+    if source in {"precomputed", "file", "files"}:
+        return None
+
+    model_name = str(config.specialized_hand_model).strip().lower()
+    if model_name in {"", "none", "off", "disabled"}:
+        return None
+
+    if model_name != "wilor":
+        raise ValueError(
+            f"Unsupported specialized hand model '{config.specialized_hand_model}'. "
+            "Supported values: none, wilor."
+        )
+
+    try:
+        from wilor_mini.pipelines.wilor_hand_pose3d_estimation_pipeline import (
+            WiLorHandPose3dEstimationPipeline,
+        )
+    except Exception as exc:
+        raise ImportError(
+            "Failed to import WiLoR-mini in live mode. "
+            "Either install WiLoR-mini or use --specialized_hand_source precomputed."
+        ) from exc
+
+    requested_device = str(config.specialized_hand_device).strip().lower()
+    if requested_device == "cuda" and not torch.cuda.is_available():
+        requested_device = "cpu"
+
+    wilor_kwargs: Dict[str, Any] = {
+        "device": torch.device(requested_device),
+        "verbose": bool(config.specialized_hand_verbose),
+    }
+    if str(config.wilor_pretrained_dir).strip():
+        wilor_kwargs["wilor_pretrained_dir"] = str(config.wilor_pretrained_dir).strip()
+    if str(config.wilor_repo_id).strip():
+        wilor_kwargs["WILOR_MINI_REPO_ID"] = str(config.wilor_repo_id).strip()
+
+    return WiLorHandPose3dEstimationPipeline(**wilor_kwargs)
+
+
+def _bbox_area(bbox: np.ndarray) -> float:
+    if bbox.size < 4 or not np.isfinite(bbox[:4]).all():
+        return -1.0
+    x0, y0, x1, y1 = bbox[:4]
+    return float(max(0.0, x1 - x0) * max(0.0, y1 - y0))
+
+
+def _extract_hand_candidates_from_wilor_outputs(
+    detect_rets: Sequence[Mapping[str, object]],
+) -> List[Dict[str, object]]:
+    candidates: List[Dict[str, object]] = []
+    for det in detect_rets:
+        preds = det.get("wilor_preds", None)
+        if not isinstance(preds, Mapping):
+            continue
+        k2d = np.asarray(preds.get("pred_keypoints_2d", None), dtype=np.float32)
+        if k2d.ndim == 3 and k2d.shape[0] > 0:
+            k2d = k2d[0]
+        if k2d.shape != (21, 2):
+            continue
+        bbox = np.asarray(det.get("hand_bbox", []), dtype=np.float32).reshape(-1)
+        is_right = int(det.get("is_right", 1))
+        candidates.append(
+            {
+                "is_right": bool(is_right == 1),
+                "keypoints_2d": k2d.astype(np.float32),
+                "bbox": bbox.astype(np.float32),
+                "bbox_area": _bbox_area(bbox),
+            }
+        )
+    return candidates
+
+
+def _extract_hand_candidates_from_serialized(
+    detections: Sequence[Mapping[str, object]],
+) -> List[Dict[str, object]]:
+    candidates: List[Dict[str, object]] = []
+    for det in detections:
+        if not isinstance(det, Mapping):
+            continue
+        k2d_obj = det.get("pred_keypoints_2d", det.get("keypoints_2d", None))
+        if k2d_obj is None:
+            continue
+        k2d = np.asarray(k2d_obj, dtype=np.float32)
+        if k2d.ndim == 3 and k2d.shape[0] > 0:
+            k2d = k2d[0]
+        if k2d.shape != (21, 2):
+            continue
+        bbox_obj = det.get("hand_bbox", det.get("bbox", []))
+        bbox = np.asarray(bbox_obj, dtype=np.float32).reshape(-1)
+        is_right = int(det.get("is_right", 1))
+        candidates.append(
+            {
+                "is_right": bool(is_right == 1),
+                "keypoints_2d": k2d.astype(np.float32),
+                "bbox": bbox.astype(np.float32),
+                "bbox_area": _bbox_area(bbox),
+            }
+        )
+    return candidates
+
+
+def _find_precomputed_hand_file(
+    hand_root: Path,
+    rel_dir: str,
+    image_name: str,
+) -> Optional[Path]:
+    base = hand_root / rel_dir
+    for ext in (".npy", ".npz", ".json"):
+        p = base / f"{image_name}{ext}"
+        if p.is_file():
+            return p
+    return None
+
+
+def _load_precomputed_hand_payload(path: Path) -> Dict[str, object]:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        if isinstance(obj, Mapping):
+            return dict(obj)
+        return {}
+
+    if suffix == ".npy":
+        arr = np.load(path, allow_pickle=True)
+        if isinstance(arr, np.ndarray) and arr.shape == () and hasattr(arr, "item"):
+            obj = arr.item()
+            if isinstance(obj, Mapping):
+                return dict(obj)
+        if isinstance(arr, Mapping):
+            return dict(arr)
+        return {}
+
+    if suffix == ".npz":
+        z = np.load(path, allow_pickle=True)
+        if "detections" in z:
+            det_obj = z["detections"]
+            if isinstance(det_obj, np.ndarray) and det_obj.shape == () and hasattr(det_obj, "item"):
+                obj = det_obj.item()
+                if isinstance(obj, Mapping):
+                    return dict(obj)
+                if isinstance(obj, list):
+                    return {"detections": obj}
+            return {"detections": det_obj.tolist() if hasattr(det_obj, "tolist") else []}
+        if "arr_0" in z:
+            arr0 = z["arr_0"]
+            if isinstance(arr0, np.ndarray) and arr0.shape == () and hasattr(arr0, "item"):
+                obj = arr0.item()
+                if isinstance(obj, Mapping):
+                    return dict(obj)
+        return {}
+
+    return {}
+
+
+def _pick_best_hand_candidate(
+    side_candidates: Sequence[Dict[str, object]],
+    sam_wrist_xy: np.ndarray,
+    wrist_max_dist_px: float,
+) -> Optional[Dict[str, object]]:
+    if len(side_candidates) == 0:
+        return None
+
+    wrist_ok = bool(np.isfinite(sam_wrist_xy).all())
+    best = None
+    best_score = float("inf")
+
+    for cand in side_candidates:
+        cand_kpts = np.asarray(cand["keypoints_2d"], dtype=np.float32)
+        cand_wrist = cand_kpts[0]
+        if not np.isfinite(cand_wrist).all():
+            continue
+
+        if wrist_ok:
+            dist = float(np.linalg.norm(cand_wrist - sam_wrist_xy))
+            if wrist_max_dist_px > 0.0 and dist > wrist_max_dist_px:
+                continue
+            score = dist
+        else:
+            # If SAM wrist is not finite, prefer larger bbox as a weak prior.
+            score = float(-float(cand.get("bbox_area", -1.0)))
+
+        if score < best_score:
+            best_score = score
+            best = cand
+
+    return best
+
+
+def _apply_hand_candidates_to_output(
+    output_dict: Dict[str, object],
+    candidates: Sequence[Dict[str, object]],
+    config: Demo2Config,
+    model_tag: str,
+) -> Dict[str, object]:
+    k70, original_arr = _extract_k70_keypoints(output_dict)
+    if k70 is None or original_arr is None:
+        return output_dict
+
+    if not isinstance(candidates, (list, tuple)) or len(candidates) == 0:
+        output_dict["specialized_hand_used"] = 0
+        output_dict["specialized_hand_num_points"] = 0
+        output_dict["specialized_hand_status_right"] = "missing"
+        output_dict["specialized_hand_status_left"] = "missing"
+        output_dict["specialized_hand_model"] = str(model_tag)
+        return output_dict
+
+    right_candidates = [c for c in candidates if bool(c["is_right"])]
+    left_candidates = [c for c in candidates if not bool(c["is_right"])]
+
+    right_sel = _pick_best_hand_candidate(
+        side_candidates=right_candidates,
+        sam_wrist_xy=np.asarray(k70[RIGHT_WRIST_MHR70_IDX], dtype=np.float32),
+        wrist_max_dist_px=float(config.specialized_hand_wrist_max_dist_px),
+    )
+    left_sel = _pick_best_hand_candidate(
+        side_candidates=left_candidates,
+        sam_wrist_xy=np.asarray(k70[LEFT_WRIST_MHR70_IDX], dtype=np.float32),
+        wrist_max_dist_px=float(config.specialized_hand_wrist_max_dist_px),
+    )
+
+    source_mask = np.zeros((70,), dtype=np.int8)
+    replace_from = 0 if bool(config.replace_wrist_with_specialized) else 1
+    right_replaced = 0
+    left_replaced = 0
+
+    if right_sel is not None:
+        k2d = np.asarray(right_sel["keypoints_2d"], dtype=np.float32)
+        for i in range(replace_from, 21):
+            mhr_idx = int(MANO_TO_MHR70_RIGHT[i])
+            if np.isfinite(k2d[i]).all():
+                k70[mhr_idx] = k2d[i]
+                source_mask[mhr_idx] = 1
+                right_replaced += 1
+
+    if left_sel is not None:
+        k2d = np.asarray(left_sel["keypoints_2d"], dtype=np.float32)
+        for i in range(replace_from, 21):
+            mhr_idx = int(MANO_TO_MHR70_LEFT[i])
+            if np.isfinite(k2d[i]).all():
+                k70[mhr_idx] = k2d[i]
+                source_mask[mhr_idx] = 1
+                left_replaced += 1
+
+    _write_back_k70_keypoints(output_dict, original_arr=original_arr, k70=k70)
+    output_dict["pred_keypoints_2d_source"] = source_mask.astype(np.int8)
+    output_dict["specialized_hand_model"] = str(model_tag)
+    output_dict["specialized_hand_used"] = int((right_replaced + left_replaced) > 0)
+    output_dict["specialized_hand_num_points"] = int(right_replaced + left_replaced)
+    output_dict["specialized_hand_replace_wrist"] = int(bool(config.replace_wrist_with_specialized))
+    output_dict["specialized_hand_status_right"] = (
+        "specialized" if right_replaced > 0 else "sam_fallback"
+    )
+    output_dict["specialized_hand_status_left"] = (
+        "specialized" if left_replaced > 0 else "sam_fallback"
+    )
+    return output_dict
+
+
+def _apply_specialized_hand_fusion_live(
+    output_dict: Dict[str, object],
+    image_bgr: np.ndarray,
+    hand_estimator: Any,
+    config: Demo2Config,
+) -> Dict[str, object]:
+    try:
+        detect_rets = hand_estimator.predict(
+            image_bgr,
+            hand_conf=float(config.specialized_hand_detector_conf),
+            rescale_factor=float(config.specialized_hand_rescale_factor),
+        )
+    except Exception:
+        return output_dict
+    candidates = _extract_hand_candidates_from_wilor_outputs(
+        detect_rets if isinstance(detect_rets, (list, tuple)) else []
+    )
+    return _apply_hand_candidates_to_output(
+        output_dict=output_dict,
+        candidates=candidates,
+        config=config,
+        model_tag=str(config.specialized_hand_model),
+    )
+
+
+def _apply_specialized_hand_fusion_precomputed(
+    output_dict: Dict[str, object],
+    hand_root: Path,
+    rel_dir: str,
+    image_name: str,
+    config: Demo2Config,
+) -> Dict[str, object]:
+    hand_file = _find_precomputed_hand_file(
+        hand_root=hand_root,
+        rel_dir=rel_dir,
+        image_name=image_name,
+    )
+    if hand_file is None:
+        return _apply_hand_candidates_to_output(
+            output_dict=output_dict,
+            candidates=[],
+            config=config,
+            model_tag=f"{config.specialized_hand_model}_precomputed",
+        )
+    payload = _load_precomputed_hand_payload(hand_file)
+    detections_obj = payload.get("detections", [])
+    if not isinstance(detections_obj, (list, tuple)):
+        detections_obj = []
+    candidates = _extract_hand_candidates_from_serialized(detections_obj)
+    out = _apply_hand_candidates_to_output(
+        output_dict=output_dict,
+        candidates=candidates,
+        config=config,
+        model_tag=f"{config.specialized_hand_model}_precomputed",
+    )
+    out["specialized_hand_input_file"] = str(hand_file)
+    return out
+
+
+def _render_specialized_hand_debug_vis(
+    image_bgr: np.ndarray,
+    pre_k70: np.ndarray,
+    post_k70: np.ndarray,
+    source_mask: np.ndarray,
+    output_dict: Mapping[str, object],
+) -> np.ndarray:
+    vis = image_bgr.copy()
+    hand_indices = np.concatenate([MANO_TO_MHR70_RIGHT, MANO_TO_MHR70_LEFT]).astype(np.int64)
+    hand_indices = np.unique(hand_indices)
+
+    # Background reference (SAM before fusion): white hollow points.
+    for idx in hand_indices.tolist():
+        p = np.asarray(pre_k70[idx], dtype=np.float32).reshape(2)
+        if not np.isfinite(p).all():
+            continue
+        x, y = int(round(float(p[0]))), int(round(float(p[1])))
+        cv2.circle(vis, (x, y), 4, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+
+    # Final points after fusion: green = specialized, orange = SAM fallback.
+    for idx in hand_indices.tolist():
+        p = np.asarray(post_k70[idx], dtype=np.float32).reshape(2)
+        if not np.isfinite(p).all():
+            continue
+        from_specialized = bool(idx < source_mask.size and int(source_mask[idx]) == 1)
+        color = (0, 220, 0) if from_specialized else (0, 165, 255)
+        x, y = int(round(float(p[0]))), int(round(float(p[1])))
+        cv2.circle(vis, (x, y), 2, color, -1, lineType=cv2.LINE_AA)
+
+    right_status = str(output_dict.get("specialized_hand_status_right", ""))
+    left_status = str(output_dict.get("specialized_hand_status_left", ""))
+    replaced = int(np.sum(source_mask[hand_indices] == 1)) if source_mask.size > 0 else 0
+
+    cv2.putText(
+        vis,
+        f"R:{right_status}  L:{left_status}  replaced:{replaced}",
+        (14, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (255, 255, 255),
+        2,
+        lineType=cv2.LINE_AA,
+    )
+    cv2.putText(
+        vis,
+        "white: SAM-before  green: specialized  orange: SAM-fallback",
+        (14, 48),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (255, 255, 255),
+        1,
+        lineType=cv2.LINE_AA,
+    )
+    return vis
+
+
 def run_demo(
     config: Demo2Config,
     estimator: Optional[SAM3DBodyEstimator] = None,
@@ -354,6 +804,23 @@ def run_demo(
     )
     if estimator is None:
         estimator = build_estimator(config)
+    hand_estimator = _build_specialized_hand_estimator(config)
+    hand_source = str(config.specialized_hand_source).strip().lower()
+    precomputed_hand_root: Optional[Path] = None
+    hand_debug_root: Optional[Path] = None
+    if bool(config.enable_specialized_hand_fusion) and hand_source in {"precomputed", "file", "files"}:
+        hand_input = str(config.specialized_hand_input_root).strip()
+        if hand_input == "":
+            raise ValueError(
+                "specialized_hand_source is precomputed but --specialized_hand_input_root is empty."
+            )
+        precomputed_hand_root = Path(hand_input).expanduser().resolve()
+        if not precomputed_hand_root.is_dir():
+            raise FileNotFoundError(f"Precomputed hand input root not found: {precomputed_hand_root}")
+    if bool(config.enable_specialized_hand_fusion) and bool(config.specialized_hand_debug_vis):
+        debug_dirname = str(config.specialized_hand_debug_dirname).strip() or "specialized_hand_debug"
+        hand_debug_root = (output_root / debug_dirname).resolve()
+        hand_debug_root.mkdir(parents=True, exist_ok=True)
 
     images_list = collect_images(config.image_folder)
     if config.include_rel_dirs:
@@ -382,6 +849,66 @@ def run_demo(
         rel_dir = _relative_dir(image_path, config.image_folder)
         image_name = Path(image_path).stem
 
+        pre_fusion_k70: Optional[np.ndarray] = None
+        if output_dict is not None and bool(config.enable_specialized_hand_fusion):
+            pre_fusion_k70, _ = _extract_k70_keypoints(output_dict)
+
+        need_live_hand_image = bool(
+            output_dict is not None
+            and bool(config.enable_specialized_hand_fusion)
+            and hand_source in {"live", "runtime"}
+            and hand_estimator is not None
+        )
+        need_hand_debug_image = bool(
+            output_dict is not None
+            and bool(config.enable_specialized_hand_fusion)
+            and bool(config.specialized_hand_debug_vis)
+        )
+        img_cv2 = None
+        if output_dict is not None and (config.debug or need_live_hand_image or need_hand_debug_image):
+            img_cv2 = cv2.imread(image_path)
+
+        if output_dict is not None and bool(config.enable_specialized_hand_fusion):
+            if hand_source in {"precomputed", "file", "files"}:
+                assert precomputed_hand_root is not None
+                output_dict = _apply_specialized_hand_fusion_precomputed(
+                    output_dict=output_dict,
+                    hand_root=precomputed_hand_root,
+                    rel_dir=rel_dir,
+                    image_name=image_name,
+                    config=config,
+                )
+            elif hand_source in {"live", "runtime"} and hand_estimator is not None and img_cv2 is not None:
+                output_dict = _apply_specialized_hand_fusion_live(
+                    output_dict=output_dict,
+                    image_bgr=img_cv2,
+                    hand_estimator=hand_estimator,
+                    config=config,
+                )
+
+        if (
+            hand_debug_root is not None
+            and output_dict is not None
+            and img_cv2 is not None
+            and pre_fusion_k70 is not None
+        ):
+            post_fusion_k70, _ = _extract_k70_keypoints(output_dict)
+            if post_fusion_k70 is not None:
+                source_mask = np.asarray(
+                    output_dict.get("pred_keypoints_2d_source", np.zeros((70,), dtype=np.int8)),
+                    dtype=np.int8,
+                ).reshape(-1)
+                vis = _render_specialized_hand_debug_vis(
+                    image_bgr=img_cv2,
+                    pre_k70=pre_fusion_k70,
+                    post_k70=post_fusion_k70,
+                    source_mask=source_mask,
+                    output_dict=output_dict,
+                )
+                vis_out_dir = hand_debug_root / rel_dir
+                vis_out_dir.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(vis_out_dir / f"{image_name}.jpg"), vis)
+
         npy_out_dir = npy_root / rel_dir
         npy_out_dir.mkdir(parents=True, exist_ok=True)
         npy_path = None
@@ -402,7 +929,6 @@ def run_demo(
             render_out_dir.mkdir(parents=True, exist_ok=True)
             mesh_out_dir.mkdir(parents=True, exist_ok=True)
 
-            img_cv2 = cv2.imread(image_path)
             if img_cv2 is not None:
                 debug_outputs = (
                     outputs
@@ -437,6 +963,21 @@ def run_demo(
         "fov_name": str(config.fov_name),
         "person_select_strategy": str(config.person_select_strategy),
         "person_index": int(config.person_index),
+        "enable_specialized_hand_fusion": bool(config.enable_specialized_hand_fusion),
+        "specialized_hand_source": str(config.specialized_hand_source),
+        "specialized_hand_model": str(config.specialized_hand_model),
+        "specialized_hand_input_root": (
+            None
+            if precomputed_hand_root is None
+            else str(precomputed_hand_root)
+        ),
+        "specialized_hand_detector_conf": float(config.specialized_hand_detector_conf),
+        "specialized_hand_rescale_factor": float(config.specialized_hand_rescale_factor),
+        "specialized_hand_wrist_max_dist_px": float(config.specialized_hand_wrist_max_dist_px),
+        "replace_wrist_with_specialized": bool(config.replace_wrist_with_specialized),
+        "specialized_hand_debug_vis": bool(config.specialized_hand_debug_vis),
+        "specialized_hand_debug_dirname": str(config.specialized_hand_debug_dirname),
+        "wilor_repo_id": str(config.wilor_repo_id),
     }
     (output_root / "stage1_meta.json").write_text(
         json.dumps(meta, indent=2),
@@ -573,6 +1114,96 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="Person index to use when --person_select_strategy=person_index.",
     )
+    parser.add_argument(
+        "--enable_specialized_hand_fusion",
+        action="store_true",
+        default=False,
+        help="Enable specialized hand-model fusion into pred_keypoints_2d.",
+    )
+    parser.add_argument(
+        "--specialized_hand_source",
+        type=str,
+        default="precomputed",
+        choices=["precomputed", "live"],
+        help="Source of specialized hand keypoints: precomputed files or live model inference.",
+    )
+    parser.add_argument(
+        "--specialized_hand_model",
+        type=str,
+        default="none",
+        choices=["none", "wilor"],
+        help="Specialized hand model used for fusion.",
+    )
+    parser.add_argument(
+        "--specialized_hand_input_root",
+        type=str,
+        default="",
+        help=(
+            "Root directory of precomputed hand detections. "
+            "Expected files: <root>/<rel_dir>/<image_name>.npy|.npz|.json"
+        ),
+    )
+    parser.add_argument(
+        "--specialized_hand_device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help="Device for specialized hand model inference.",
+    )
+    parser.add_argument(
+        "--specialized_hand_detector_conf",
+        type=float,
+        default=0.3,
+        help="Detection confidence threshold for specialized hand detector.",
+    )
+    parser.add_argument(
+        "--specialized_hand_rescale_factor",
+        type=float,
+        default=2.5,
+        help="Hand crop rescale factor for specialized hand model.",
+    )
+    parser.add_argument(
+        "--specialized_hand_wrist_max_dist_px",
+        type=float,
+        default=140.0,
+        help="Reject specialized hand candidate if wrist is too far from SAM wrist (pixels).",
+    )
+    parser.add_argument(
+        "--replace_wrist_with_specialized",
+        action="store_true",
+        default=False,
+        help="Also replace wrist keypoint with specialized model (default keeps SAM wrist).",
+    )
+    parser.add_argument(
+        "--specialized_hand_debug_vis",
+        action="store_true",
+        default=False,
+        help="Save debug overlays for SAM-vs-specialized hand fusion.",
+    )
+    parser.add_argument(
+        "--specialized_hand_debug_dirname",
+        type=str,
+        default="specialized_hand_debug",
+        help="Subfolder under output root used for specialized hand fusion debug images.",
+    )
+    parser.add_argument(
+        "--specialized_hand_verbose",
+        action="store_true",
+        default=False,
+        help="Enable verbose logs from specialized hand model.",
+    )
+    parser.add_argument(
+        "--wilor_pretrained_dir",
+        type=str,
+        default="",
+        help="Optional local directory for WiLoR-mini pretrained assets.",
+    )
+    parser.add_argument(
+        "--wilor_repo_id",
+        type=str,
+        default="warmshao/WiLoR-mini",
+        help="Hugging Face repo id used by WiLoR-mini for pretrained assets.",
+    )
     return parser
 
 
@@ -602,6 +1233,20 @@ def namespace_to_config(args: argparse.Namespace) -> Demo2Config:
         include_rel_dirs=args.include_rel_dirs,
         person_select_strategy=args.person_select_strategy,
         person_index=args.person_index,
+        enable_specialized_hand_fusion=args.enable_specialized_hand_fusion,
+        specialized_hand_source=args.specialized_hand_source,
+        specialized_hand_model=args.specialized_hand_model,
+        specialized_hand_input_root=args.specialized_hand_input_root,
+        specialized_hand_device=args.specialized_hand_device,
+        specialized_hand_detector_conf=args.specialized_hand_detector_conf,
+        specialized_hand_rescale_factor=args.specialized_hand_rescale_factor,
+        specialized_hand_wrist_max_dist_px=args.specialized_hand_wrist_max_dist_px,
+        replace_wrist_with_specialized=args.replace_wrist_with_specialized,
+        specialized_hand_debug_vis=args.specialized_hand_debug_vis,
+        specialized_hand_debug_dirname=args.specialized_hand_debug_dirname,
+        specialized_hand_verbose=args.specialized_hand_verbose,
+        wilor_pretrained_dir=args.wilor_pretrained_dir,
+        wilor_repo_id=args.wilor_repo_id,
     )
 
 

@@ -8,6 +8,79 @@ This repo is now organized as a 3-stage pipeline:
 
 You can run all stages with one command using `run_full_pipeline.py`, or run each stage separately for debugging.
 
+## V2 Hand-Focused Pipeline (SAM + WiLoR-mini)
+
+For mostly static single-person sequences (for example sign language), use the v2 strategy in `plan_v2.md`:
+
+1. keep SAM-3D-Body as the base 70x2 keypoint source,
+2. run WiLoR-mini for stronger hand keypoints,
+3. map MANO/OpenPose hand indices to MHR70 hand indices using `hand_mapping.md`,
+4. replace only hand keypoints when specialized hand confidence is reliable,
+5. triangulate from mixed 2D points (specialized hands + SAM body),
+6. optimize both body pose and hand pose (`hand108`), while fixing identity-like parameters per sequence.
+
+Implementation status: this section documents the target v2 update path; the concrete implementation checklist is tracked in `plan_v2.md`.
+
+Important policy in v2:
+- alignment transform should use stable upper-body anchors only (shoulders/elbows/wrists),
+- `L_vel` and `L_acc` are removed to reduce runtime,
+- bad frames are not retried; they are interpolated in recovery.
+
+### WiLoR-mini keypoint extraction notes
+
+Repo checked: `https://github.com/warmshao/WiLoR-mini`.
+
+- Pipeline class: `WiLorHandPose3dEstimationPipeline`.
+- Per detected hand output is at `detect_rets[i]["wilor_preds"]`.
+- Use:
+  - `wilor_preds["pred_keypoints_2d"]` for 2D fusion,
+  - `is_right` to map to left/right MHR hand indices.
+- WiLoR-mini MANO/OpenPose order:
+  - `mano_to_openpose = [0, 13, 14, 15, 16, 1, 2, 3, 17, 4, 5, 6, 18, 10, 11, 12, 19, 7, 8, 9, 20]`.
+
+Use `hand_mapping.md` directly for conversion into MHR70 hand keypoint indices.
+
+### Run WiLoR Separately (Recommended)
+
+If WiLoR cannot be installed in your SAM-3D environment, run it separately and export hand detections first.
+
+1. In WiLoR environment, precompute hand detections:
+
+```bash
+python run_wilor_precompute.py \
+  --image_folder /path/to/frames_root \
+  --output_root /path/to/wilor_precomputed \
+  --device cuda \
+  --hand_conf 0.3 \
+  --rescale_factor 2.5 \
+  --debug_vis
+```
+
+Optional debug output location:
+- `--debug_vis_root /path/to/wilor_debug_vis` (default is `<output_root>/debug_vis`)
+
+2. In SAM-3D pipeline environment, fuse precomputed hands:
+
+```bash
+python run_full_pipeline.py \
+  --image_folder /path/to/frames_root \
+  --output_root /path/to/pipeline_out \
+  --cams left front right \
+  --caliscope_toml /path/to/config.toml \
+  --mhr_py mhr70.py \
+  --checkpoint_path ./checkpoints/sam-3d-body-dinov3/model.ckpt \
+  --mhr_path ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt \
+  --hf_repo facebook/sam-3d-body-dinov3 \
+  --enable_specialized_hand_fusion \
+  --specialized_hand_source precomputed \
+  --specialized_hand_model wilor \
+  --specialized_hand_input_root /path/to/wilor_precomputed \
+  --specialized_hand_debug_vis
+```
+
+Precomputed hand files are expected as:
+`<specialized_hand_input_root>/<rel_dir>/<image_stem>.npy` (or `.npz`/`.json`).
+
 ## Input Layout
 
 `run_full_pipeline.py` expects camera image names as stems, for example:
@@ -53,6 +126,7 @@ python run_full_pipeline.py \
 - `--save_mhr_params`: save extracted MHR params from stage-1 under `inference/mhr_params`.
 - `--person_select_strategy largest_bbox`: choose stage-1 person selection mode (`first`, `largest_bbox`, `person_index`).
 - `--person_index 0`: used only with `--person_select_strategy person_index`.
+- `--specialized_hand_debug_vis --specialized_hand_debug_dirname specialized_hand_debug`: save stage-1 overlays comparing SAM hand points (before) vs specialized replacements (after).
 - `--save_triangulation_debug`: save overlay debug images for triangulation.
 - `--debug_inference` / `--debug_triangulation`: interactive/debug rendering for stage-1/stage-2.
 - For multi-frame runs, `--debug_triangulation` opens interactive 3D only on the first frame by default.
@@ -69,6 +143,18 @@ python run_full_pipeline.py \
 - `--smoothing_alpha 0.65 --smoothing_median_window 5 --smoothing_outlier_sigma 3.5`: sequence smoothing controls.
 - `--debug_4d --save_4d_mp4`: interactive 4D playback + MP4 export aliases.
 
+### Recommended settings for hand-focused mostly-static sequences
+
+- Keep non-pose identity fixed:
+  - `--fixed_mhr_param_frame_idx <clean_frame>`
+  - `--fixed_mhr_param_cam front`
+- Keep lower body stable:
+  - `--freeze_lower_body`
+- Keep interpolation enabled for failure recovery:
+  - keep sequence recovery on,
+  - use bounded one-sided copy (`--max_edge_recovery_copy_span` small).
+- Follow `plan_v2.md` for the no-retry bad-frame policy and specialized hand fusion path.
+
 ## Output Structure
 
 `<output_root>/`
@@ -77,6 +163,7 @@ python run_full_pipeline.py \
 - `inference/npy/...` per-camera SAM outputs
 - `inference/stage1_meta.json` stage-1 cache contract metadata
 - `inference/render/...` and `inference/mesh/...` if `--debug_inference`
+- `inference/specialized_hand_debug/...` (or custom `--specialized_hand_debug_dirname`) if `--specialized_hand_debug_vis`
 - `inference/mhr_params/...` if `--save_mhr_params`
 - `triangulation/.../triangulated.npz`
 - `triangulation/.../debug/` if `--save_triangulation_debug`

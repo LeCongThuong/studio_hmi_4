@@ -69,6 +69,20 @@ class FullPipelineConfig:
     save_mhr_params: bool = False
     person_select_strategy: str = "largest_bbox"
     person_index: int = 0
+    enable_specialized_hand_fusion: bool = False
+    specialized_hand_source: str = "precomputed"
+    specialized_hand_model: str = "none"
+    specialized_hand_input_root: str = ""
+    specialized_hand_device: str = "cuda"
+    specialized_hand_detector_conf: float = 0.3
+    specialized_hand_rescale_factor: float = 2.5
+    specialized_hand_wrist_max_dist_px: float = 140.0
+    replace_wrist_with_specialized: bool = False
+    specialized_hand_debug_vis: bool = False
+    specialized_hand_debug_dirname: str = "specialized_hand_debug"
+    specialized_hand_verbose: bool = False
+    wilor_pretrained_dir: str = ""
+    wilor_repo_id: str = "warmshao/WiLoR-mini"
     frame_rel: Optional[str] = None
     skip_inference: bool = False
     skip_triangulation: bool = False
@@ -100,13 +114,17 @@ class FullPipelineConfig:
     with_scale: bool = False
     huber_m: float = 0.03
     w_pose_reg: float = 1e-3
+    w_hand_reg: float = 1e-3
     w_temporal: float = 3e-3
-    w_temporal_velocity: float = 2e-3
-    w_temporal_accel: float = 5e-4
+    w_temporal_velocity: float = 0.0
+    w_temporal_accel: float = 0.0
     temporal_init_blend: float = 0.7
     temporal_extrapolation: float = 1.0
     fixed_mhr_param_frame_idx: Optional[int] = None
     fixed_mhr_param_cam: str = "front"
+    fixed_hand_pose_from_reference: bool = False
+    optimize_hand_pose: bool = True
+    use_anchor_similarity: bool = True
     bad_loss_threshold: float = 3e-5
     bad_data_loss_threshold: float = 2e-5
     bad_loss_growth_ratio: float = 1.5
@@ -115,7 +133,7 @@ class FullPipelineConfig:
     freeze_lower_body: bool = False
     topk_print: int = 10
     save_opt_debug: bool = False
-    bad_frame_max_retries: int = 2
+    bad_frame_max_retries: int = 0
     min_views: int = 2
     recover_bad_frames: bool = True
     fill_missing_frames: bool = True
@@ -299,6 +317,21 @@ def _expected_stage1_meta(config: FullPipelineConfig, image_root: Path) -> Dict[
         "fov_name": str(config.fov_name),
         "person_select_strategy": str(config.person_select_strategy),
         "person_index": int(config.person_index),
+        "enable_specialized_hand_fusion": bool(config.enable_specialized_hand_fusion),
+        "specialized_hand_source": str(config.specialized_hand_source),
+        "specialized_hand_model": str(config.specialized_hand_model),
+        "specialized_hand_input_root": (
+            None
+            if str(config.specialized_hand_input_root).strip() == ""
+            else str(Path(config.specialized_hand_input_root).expanduser().resolve())
+        ),
+        "specialized_hand_detector_conf": float(config.specialized_hand_detector_conf),
+        "specialized_hand_rescale_factor": float(config.specialized_hand_rescale_factor),
+        "specialized_hand_wrist_max_dist_px": float(config.specialized_hand_wrist_max_dist_px),
+        "replace_wrist_with_specialized": bool(config.replace_wrist_with_specialized),
+        "specialized_hand_debug_vis": bool(config.specialized_hand_debug_vis),
+        "specialized_hand_debug_dirname": str(config.specialized_hand_debug_dirname),
+        "wilor_repo_id": str(config.wilor_repo_id),
     }
 
 
@@ -326,6 +359,17 @@ def _stage1_meta_matches(
         "fov_name",
         "person_select_strategy",
         "person_index",
+        "enable_specialized_hand_fusion",
+        "specialized_hand_source",
+        "specialized_hand_model",
+        "specialized_hand_input_root",
+        "specialized_hand_detector_conf",
+        "specialized_hand_rescale_factor",
+        "specialized_hand_wrist_max_dist_px",
+        "replace_wrist_with_specialized",
+        "specialized_hand_debug_vis",
+        "specialized_hand_debug_dirname",
+        "wilor_repo_id",
     ]
     for key in keys:
         if existing_meta.get(key) != expected_meta.get(key):
@@ -396,19 +440,17 @@ def _safe_scalar_int(d: Dict[str, Any], key: str) -> Optional[int]:
 def _load_fixed_non_pose_mhr_params(
     npy_dir: Path,
     cam: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    include_hand_pose: bool,
+) -> tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
     npy_path = find_existing_with_exts(npy_dir, cam, NP_EXTS)
     if npy_path is None:
         raise FileNotFoundError(
             f"Could not find fixed-parameter source file for cam='{cam}' in {npy_dir}"
         )
     d = load_npy_dict(npy_path)
-    required = (
-        "hand_pose_params",
-        "scale_params",
-        "shape_params",
-        "expr_params",
-    )
+    required = ["scale_params", "shape_params", "expr_params"]
+    if include_hand_pose:
+        required = ["hand_pose_params"] + required
     missing = [k for k in required if k not in d]
     if missing:
         raise KeyError(
@@ -416,11 +458,13 @@ def _load_fixed_non_pose_mhr_params(
             + ", ".join(missing)
             + f" (file: {npy_path})"
         )
-    hand = np.asarray(d["hand_pose_params"], dtype=np.float32).reshape(-1)
+    hand: Optional[np.ndarray] = None
+    if include_hand_pose:
+        hand = np.asarray(d["hand_pose_params"], dtype=np.float32).reshape(-1)
     scale = np.asarray(d["scale_params"], dtype=np.float32).reshape(-1)
     shape = np.asarray(d["shape_params"], dtype=np.float32).reshape(-1)
     expr = np.asarray(d["expr_params"], dtype=np.float32).reshape(-1)
-    if not np.isfinite(hand).all():
+    if hand is not None and (not np.isfinite(hand).all()):
         raise ValueError(f"Non-finite hand_pose_params in fixed source: {npy_path}")
     if not np.isfinite(scale).all():
         raise ValueError(f"Non-finite scale_params in fixed source: {npy_path}")
@@ -487,6 +531,13 @@ def _recover_missing_and_bad_frames(
             continue
 
         # Do not let bad/unusable frame payloads leak into smoothing/debug by default.
+        # For v2 behavior, bad optimization outputs are treated as unusable artifacts.
+        if fr.optimized_npy is not None and fr.optimized_npy.exists():
+            try:
+                fr.optimized_npy.unlink()
+            except Exception:
+                pass
+        fr.optimized_npy = None
         frame_dicts[i] = None
         valid[i] = False
 
@@ -655,6 +706,66 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="Person index used when --person_select_strategy=person_index.",
     )
+    ap.add_argument(
+        "--enable_specialized_hand_fusion",
+        action="store_true",
+        default=False,
+        help="Enable specialized hand-model fusion into stage-1 pred_keypoints_2d.",
+    )
+    ap.add_argument(
+        "--specialized_hand_source",
+        type=str,
+        default="precomputed",
+        choices=["precomputed", "live"],
+        help="Source of specialized hand keypoints used in stage-1 fusion.",
+    )
+    ap.add_argument(
+        "--specialized_hand_model",
+        type=str,
+        default="none",
+        choices=["none", "wilor"],
+        help="Specialized hand model to use in stage-1 fusion.",
+    )
+    ap.add_argument(
+        "--specialized_hand_input_root",
+        type=str,
+        default="",
+        help=(
+            "Root directory of precomputed hand detections. "
+            "Expected files: <root>/<rel_dir>/<image_name>.npy|.npz|.json"
+        ),
+    )
+    ap.add_argument(
+        "--specialized_hand_device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help="Device for specialized hand model inference.",
+    )
+    ap.add_argument("--specialized_hand_detector_conf", type=float, default=0.3)
+    ap.add_argument("--specialized_hand_rescale_factor", type=float, default=2.5)
+    ap.add_argument("--specialized_hand_wrist_max_dist_px", type=float, default=140.0)
+    ap.add_argument(
+        "--replace_wrist_with_specialized",
+        action="store_true",
+        default=False,
+        help="Also replace wrists with specialized model output (default keeps SAM wrists).",
+    )
+    ap.add_argument(
+        "--specialized_hand_debug_vis",
+        action="store_true",
+        default=False,
+        help="Save SAM-vs-specialized hand fusion overlays during stage-1.",
+    )
+    ap.add_argument(
+        "--specialized_hand_debug_dirname",
+        type=str,
+        default="specialized_hand_debug",
+        help="Subfolder under stage-1 output root used for fusion debug images.",
+    )
+    ap.add_argument("--specialized_hand_verbose", action="store_true", default=False)
+    ap.add_argument("--wilor_pretrained_dir", type=str, default="")
+    ap.add_argument("--wilor_repo_id", type=str, default="warmshao/WiLoR-mini")
 
     # Pipeline control
     ap.add_argument("--frame_rel", default=None, type=str, help="Optional relative frame dir under npy root.")
@@ -713,9 +824,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--with_scale", action="store_true")
     ap.add_argument("--huber_m", type=float, default=0.03)
     ap.add_argument("--w_pose_reg", type=float, default=1e-3)
+    ap.add_argument("--w_hand_reg", type=float, default=1e-3)
     ap.add_argument("--w_temporal", type=float, default=3e-3)
-    ap.add_argument("--w_temporal_velocity", type=float, default=2e-3)
-    ap.add_argument("--w_temporal_accel", type=float, default=5e-4)
+    ap.add_argument("--w_temporal_velocity", type=float, default=0.0)
+    ap.add_argument("--w_temporal_accel", type=float, default=0.0)
     ap.add_argument("--temporal_init_blend", type=float, default=0.7)
     ap.add_argument("--temporal_extrapolation", type=float, default=1.0)
     ap.add_argument(
@@ -724,7 +836,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional frame index used as fixed source for non-pose MHR params "
-            "(hand/scale/shape/expr) across the whole sequence."
+            "(scale/shape/expr) across the whole sequence. "
+            "Hand pose can also be fixed by adding --fixed_hand_pose_from_reference."
         ),
     )
     ap.add_argument(
@@ -735,6 +848,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Camera name used to read fixed non-pose MHR params from "
             "--fixed_mhr_param_frame_idx."
         ),
+    )
+    ap.add_argument(
+        "--fixed_hand_pose_from_reference",
+        action="store_true",
+        default=False,
+        help="Also fix hand_pose_params from reference frame/camera (disabled by default in v2).",
+    )
+    ap.add_argument(
+        "--no_optimize_hand_pose",
+        action="store_true",
+        default=False,
+        help="Disable hand108 optimization (v2 default is to optimize hand pose).",
+    )
+    ap.add_argument(
+        "--no_anchor_similarity",
+        action="store_true",
+        default=False,
+        help="Disable anchor-only similarity alignment (fallback to all supervised points).",
     )
     ap.add_argument("--bad_loss_threshold", type=float, default=3e-5)
     ap.add_argument("--bad_data_loss_threshold", type=float, default=2e-5)
@@ -751,7 +882,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Freeze lower-body pose dimensions in stage-3 optimization.",
     )
-    ap.add_argument("--bad_frame_max_retries", type=int, default=2)
+    ap.add_argument("--bad_frame_max_retries", type=int, default=0)
     ap.add_argument("--topk_print", type=int, default=10)
     ap.add_argument("--save_opt_debug", action="store_true", default=False, help="Save optimization debug plots/artifacts.")
 
@@ -831,6 +962,20 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
         save_mhr_params=bool(getattr(args, "save_mhr_params", False)),
         person_select_strategy=getattr(args, "person_select_strategy", "largest_bbox"),
         person_index=int(getattr(args, "person_index", 0)),
+        enable_specialized_hand_fusion=bool(getattr(args, "enable_specialized_hand_fusion", False)),
+        specialized_hand_source=str(getattr(args, "specialized_hand_source", "precomputed")),
+        specialized_hand_model=str(getattr(args, "specialized_hand_model", "none")),
+        specialized_hand_input_root=str(getattr(args, "specialized_hand_input_root", "")),
+        specialized_hand_device=str(getattr(args, "specialized_hand_device", "cuda")),
+        specialized_hand_detector_conf=float(getattr(args, "specialized_hand_detector_conf", 0.3)),
+        specialized_hand_rescale_factor=float(getattr(args, "specialized_hand_rescale_factor", 2.5)),
+        specialized_hand_wrist_max_dist_px=float(getattr(args, "specialized_hand_wrist_max_dist_px", 140.0)),
+        replace_wrist_with_specialized=bool(getattr(args, "replace_wrist_with_specialized", False)),
+        specialized_hand_debug_vis=bool(getattr(args, "specialized_hand_debug_vis", False)),
+        specialized_hand_debug_dirname=str(getattr(args, "specialized_hand_debug_dirname", "specialized_hand_debug")),
+        specialized_hand_verbose=bool(getattr(args, "specialized_hand_verbose", False)),
+        wilor_pretrained_dir=str(getattr(args, "wilor_pretrained_dir", "")),
+        wilor_repo_id=str(getattr(args, "wilor_repo_id", "warmshao/WiLoR-mini")),
         frame_rel=getattr(args, "frame_rel", None),
         skip_inference=bool(getattr(args, "skip_inference", False)),
         skip_triangulation=bool(getattr(args, "skip_triangulation", False)),
@@ -862,13 +1007,17 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
         with_scale=bool(getattr(args, "with_scale", False)),
         huber_m=float(getattr(args, "huber_m", 0.03)),
         w_pose_reg=float(getattr(args, "w_pose_reg", 1e-3)),
+        w_hand_reg=float(getattr(args, "w_hand_reg", 1e-3)),
         w_temporal=float(getattr(args, "w_temporal", 3e-3)),
-        w_temporal_velocity=float(getattr(args, "w_temporal_velocity", 2e-3)),
-        w_temporal_accel=float(getattr(args, "w_temporal_accel", 5e-4)),
+        w_temporal_velocity=float(getattr(args, "w_temporal_velocity", 0.0)),
+        w_temporal_accel=float(getattr(args, "w_temporal_accel", 0.0)),
         temporal_init_blend=float(getattr(args, "temporal_init_blend", 0.7)),
         temporal_extrapolation=float(getattr(args, "temporal_extrapolation", 1.0)),
         fixed_mhr_param_frame_idx=getattr(args, "fixed_mhr_param_frame_idx", None),
         fixed_mhr_param_cam=str(getattr(args, "fixed_mhr_param_cam", "front")),
+        fixed_hand_pose_from_reference=bool(getattr(args, "fixed_hand_pose_from_reference", False)),
+        optimize_hand_pose=not bool(getattr(args, "no_optimize_hand_pose", False)),
+        use_anchor_similarity=not bool(getattr(args, "no_anchor_similarity", False)),
         bad_loss_threshold=float(getattr(args, "bad_loss_threshold", 3e-5)),
         bad_data_loss_threshold=float(getattr(args, "bad_data_loss_threshold", 2e-5)),
         bad_loss_growth_ratio=float(getattr(args, "bad_loss_growth_ratio", 1.5)),
@@ -877,7 +1026,7 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
         freeze_lower_body=bool(getattr(args, "freeze_lower_body", False)),
         topk_print=int(getattr(args, "topk_print", 10)),
         save_opt_debug=bool(getattr(args, "save_opt_debug", False)),
-        bad_frame_max_retries=int(getattr(args, "bad_frame_max_retries", 2)),
+        bad_frame_max_retries=int(getattr(args, "bad_frame_max_retries", 0)),
         min_views=int(getattr(args, "min_views", 2)),
         recover_bad_frames=not bool(getattr(args, "no_recover_bad_frames", False)),
         fill_missing_frames=not bool(getattr(args, "no_fill_missing_frames", False)),
@@ -969,6 +1118,20 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                 include_rel_dirs=[config.frame_rel] if config.frame_rel else None,
                 person_select_strategy=config.person_select_strategy,
                 person_index=config.person_index,
+                enable_specialized_hand_fusion=config.enable_specialized_hand_fusion,
+                specialized_hand_source=config.specialized_hand_source,
+                specialized_hand_model=config.specialized_hand_model,
+                specialized_hand_input_root=config.specialized_hand_input_root,
+                specialized_hand_device=config.specialized_hand_device,
+                specialized_hand_detector_conf=config.specialized_hand_detector_conf,
+                specialized_hand_rescale_factor=config.specialized_hand_rescale_factor,
+                specialized_hand_wrist_max_dist_px=config.specialized_hand_wrist_max_dist_px,
+                replace_wrist_with_specialized=config.replace_wrist_with_specialized,
+                specialized_hand_debug_vis=config.specialized_hand_debug_vis,
+                specialized_hand_debug_dirname=config.specialized_hand_debug_dirname,
+                specialized_hand_verbose=config.specialized_hand_verbose,
+                wilor_pretrained_dir=config.wilor_pretrained_dir,
+                wilor_repo_id=config.wilor_repo_id,
             )
             demo_result = run_demo(demo_cfg)
             npy_root = demo_result.npy_root.resolve()
@@ -1021,11 +1184,17 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
         ) = _load_fixed_non_pose_mhr_params(
             npy_dir=ref_npy_dir,
             cam=fixed_cam,
+            include_hand_pose=bool(config.fixed_hand_pose_from_reference),
         )
         print(
             "[PIPELINE] Using fixed non-pose MHR params from "
             f"frame_index={ref_idx} rel='{ref_entry.rel_dir or '.'}' cam='{fixed_cam}'."
         )
+        if not bool(config.fixed_hand_pose_from_reference):
+            print(
+                "[PIPELINE] Hand pose is NOT fixed from reference "
+                "(use --fixed_hand_pose_from_reference to enable)."
+            )
 
     total_frames = len(frame_inputs)
     tri_debug_shown_once = False
@@ -1270,6 +1439,7 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                 with_scale=config.with_scale,
                 huber_m=config.huber_m,
                 w_pose_reg=config.w_pose_reg,
+                w_hand_reg=config.w_hand_reg,
                 w_temporal=config.w_temporal,
                 w_temporal_velocity=config.w_temporal_velocity,
                 w_temporal_accel=config.w_temporal_accel,
@@ -1284,6 +1454,8 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                 fixed_scale_params=None if fixed_scale_params is None else fixed_scale_params.copy(),
                 fixed_shape_params=None if fixed_shape_params is None else fixed_shape_params.copy(),
                 fixed_expr_params=None if fixed_expr_params is None else fixed_expr_params.copy(),
+                optimize_hand_pose=bool(config.optimize_hand_pose),
+                use_anchor_similarity=bool(config.use_anchor_similarity),
                 bad_loss_threshold=config.bad_loss_threshold,
                 bad_data_loss_threshold=config.bad_data_loss_threshold,
                 bad_loss_growth_ratio=config.bad_loss_growth_ratio,
@@ -1319,9 +1491,10 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
             and config.recover_bad_frames
             and prev_good_pose is not None
             and use_temporal_priors
+            and int(config.bad_frame_max_retries) > 0
         ):
             print(f"[PIPELINE] Retrying bad-loss frame '{rel_dir}' with stronger temporal prior")
-            max_retries = max(1, int(config.bad_frame_max_retries))
+            max_retries = max(0, int(config.bad_frame_max_retries))
             for retry_i in range(max_retries):
                 gain = float(1.0 + (retry_i + 1) * 2.0)
                 try:
@@ -1340,6 +1513,7 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                         with_scale=config.with_scale,
                         huber_m=config.huber_m,
                         w_pose_reg=config.w_pose_reg,
+                        w_hand_reg=config.w_hand_reg,
                         w_temporal=max(config.w_temporal * gain, 3e-4),
                         w_temporal_velocity=max(config.w_temporal_velocity * gain, 2e-4),
                         w_temporal_accel=max(config.w_temporal_accel * gain, 1e-4),
@@ -1354,6 +1528,8 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
                         fixed_scale_params=None if fixed_scale_params is None else fixed_scale_params.copy(),
                         fixed_shape_params=None if fixed_shape_params is None else fixed_shape_params.copy(),
                         fixed_expr_params=None if fixed_expr_params is None else fixed_expr_params.copy(),
+                        optimize_hand_pose=bool(config.optimize_hand_pose),
+                        use_anchor_similarity=bool(config.use_anchor_similarity),
                         bad_loss_threshold=config.bad_loss_threshold,
                         bad_data_loss_threshold=config.bad_data_loss_threshold,
                         bad_loss_growth_ratio=config.bad_loss_growth_ratio,

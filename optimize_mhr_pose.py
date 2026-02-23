@@ -83,6 +83,18 @@ LOWER_BODY_POSE_IDXS_BY_DIM = {
     ),
 }
 
+ALIGNMENT_ANCHOR_NAMES = {
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "neck",
+    "left_acromion",
+    "right_acromion",
+}
+
 
 @dataclass
 class OptimizationConfig:
@@ -113,8 +125,11 @@ class OptimizationConfig:
     temporal_init_blend: float = 0.7
     temporal_extrapolation: float = 1.0
     w_temporal: float = 3e-3
-    w_temporal_velocity: float = 2e-3
-    w_temporal_accel: float = 5e-4
+    w_temporal_velocity: float = 0.0
+    w_temporal_accel: float = 0.0
+    optimize_hand_pose: bool = True
+    w_hand_reg: float = 1e-3
+    use_anchor_similarity: bool = True
     bad_loss_threshold: float = 3e-5
     bad_data_loss_threshold: float = 2e-5
     bad_loss_growth_ratio: float = 1.5
@@ -408,6 +423,38 @@ def classify_bad_optimization(
     )
 
 
+def _build_alignment_anchor_local_indices(
+    subset_names: Optional[np.ndarray],
+) -> np.ndarray:
+    if subset_names is None:
+        return np.zeros((0,), dtype=np.int64)
+    names = np.asarray(subset_names).reshape(-1)
+    idxs: List[int] = []
+    for i, nm in enumerate(names):
+        if str(nm) in ALIGNMENT_ANCHOR_NAMES:
+            idxs.append(int(i))
+    if len(idxs) == 0:
+        return np.zeros((0,), dtype=np.int64)
+    return np.asarray(sorted(set(idxs)), dtype=np.int64)
+
+
+def _select_alignment_subset_tensors(
+    predM_v: torch.Tensor,
+    gtM_v: torch.Tensor,
+    wM_v: torch.Tensor,
+    valid_idx_t: torch.Tensor,
+    anchor_local_idx_t: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if anchor_local_idx_t is None or int(anchor_local_idx_t.numel()) == 0:
+        return predM_v, gtM_v, wM_v
+    if int(valid_idx_t.numel()) == 0:
+        return predM_v, gtM_v, wM_v
+    anchor_mask = (valid_idx_t[:, None] == anchor_local_idx_t[None, :]).any(dim=1)
+    if int(anchor_mask.sum().item()) >= 3:
+        return predM_v[anchor_mask], gtM_v[anchor_mask], wM_v[anchor_mask]
+    return predM_v, gtM_v, wM_v
+
+
 # -----------------------------
 # sam-3d-body forward FK helper
 # -----------------------------
@@ -610,10 +657,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--huber_m", type=float, default=0.03, help="Huber delta in meters")
     ap.add_argument("--w_pose_reg", type=float, default=1e-3)
     ap.add_argument("--w_temporal", type=float, default=3e-3, help="Temporal pose prior weight when --init_pose_npy is provided.")
-    ap.add_argument("--w_temporal_velocity", type=float, default=2e-3, help="Weight for temporal velocity target (pose extrapolation from previous 2 frames).")
-    ap.add_argument("--w_temporal_accel", type=float, default=5e-4, help="Weight for temporal acceleration smoothing when previous 2 frames are available.")
+    ap.add_argument("--w_temporal_velocity", type=float, default=0.0, help="Weight for temporal velocity target (pose extrapolation from previous 2 frames).")
+    ap.add_argument("--w_temporal_accel", type=float, default=0.0, help="Weight for temporal acceleration smoothing when previous 2 frames are available.")
+    ap.add_argument("--w_hand_reg", type=float, default=1e-3, help="Regularization weight for optimized hand108 toward initialization.")
     ap.add_argument("--temporal_init_blend", type=float, default=0.7, help="Blend between per-view init and temporal init pose.")
     ap.add_argument("--temporal_extrapolation", type=float, default=1.0, help="Extrapolation gain for temporal velocity target using prev and prev-prev poses.")
+    ap.add_argument("--no_optimize_hand_pose", action="store_true", help="Disable hand108 optimization.")
+    ap.add_argument("--no_anchor_similarity", action="store_true", help="Disable anchor-only similarity and use all supervised points.")
     ap.add_argument("--topk_print", type=int, default=10)
     ap.add_argument("--no_debug_artifacts", action="store_true", help="Skip debug plots/npz/ply for faster execution.")
     ap.add_argument("--min_iters", type=int, default=50, help="Minimum iterations before early stopping is allowed.")
@@ -668,6 +718,9 @@ def namespace_to_config(args: argparse.Namespace) -> OptimizationConfig:
         w_temporal=args.w_temporal,
         w_temporal_velocity=args.w_temporal_velocity,
         w_temporal_accel=args.w_temporal_accel,
+        optimize_hand_pose=not args.no_optimize_hand_pose,
+        w_hand_reg=args.w_hand_reg,
+        use_anchor_similarity=not args.no_anchor_similarity,
         temporal_init_blend=args.temporal_init_blend,
         temporal_extrapolation=args.temporal_extrapolation,
         topk_print=args.topk_print,
@@ -744,6 +797,14 @@ def run_optimization(
     finite_gt_mask_t = torch.from_numpy(finite_gt_mask_np).to(device=device, dtype=torch.bool)
     gtM_t = to_torch(gtM, device)
     wM_t = to_torch(wM_np, device)
+    anchor_local_idx_np = (
+        _build_alignment_anchor_local_indices(subset_names)
+        if bool(config.use_anchor_similarity)
+        else np.zeros((0,), dtype=np.int64)
+    )
+    anchor_local_idx_t: Optional[torch.Tensor] = None
+    if int(anchor_local_idx_np.size) > 0:
+        anchor_local_idx_t = torch.from_numpy(anchor_local_idx_np).to(device=device, dtype=torch.long)
 
     # ---- Load per-view SAM outputs and score them ----
     view_scores_3d = {}
@@ -798,7 +859,14 @@ def run_optimization(
         gtM_v = gtM_t.index_select(0, valid_idx_t)
         wM_v = wM_view_t.index_select(0, valid_idx_t)
 
-        s, R, t = umeyama_similarity(predM_v, gtM_v, w=wM_v, with_scale=config.with_scale)
+        pred_align_v, gt_align_v, w_align_v = _select_alignment_subset_tensors(
+            predM_v=predM_v,
+            gtM_v=gtM_v,
+            wM_v=wM_v,
+            valid_idx_t=valid_idx_t,
+            anchor_local_idx_t=anchor_local_idx_t,
+        )
+        s, R, t = umeyama_similarity(pred_align_v, gt_align_v, w=w_align_v, with_scale=config.with_scale)
         predM_aligned_v = s * (predM_v @ R.T) + t[None, :]
         r = torch.sqrt(((predM_aligned_v - gtM_v) ** 2).sum(dim=1) + 1e-12)
         score = (wM_v * r).sum() / (wM_v.sum() + 1e-9)
@@ -870,6 +938,7 @@ def run_optimization(
             optimize_mask[lower_idxs_t] = 0.0
 
     init_pose_ref = init_pose_raw.clone()
+    init_hand_ref = init_hand.clone()
     frozen_pose_target = init_pose_raw.clone()
     temporal_prev_np = config.init_prev_body_pose
     if temporal_prev_np is None:
@@ -908,9 +977,17 @@ def run_optimization(
                 frozen_pose_target,
             )
 
-    # ---- Optimize pose (leaf tensor) ----
+    optimize_hand_pose = bool(config.optimize_hand_pose) and (config.fixed_hand_pose_params is None)
+
+    # ---- Optimize pose (+ optional hand108) ----
     pose = init_pose_ref.clone().detach().requires_grad_(True)
-    opt = torch.optim.Adam([pose], lr=config.lr)
+    hand = init_hand_ref.clone().detach()
+    if optimize_hand_pose:
+        hand.requires_grad_(True)
+    opt_params: List[torch.Tensor] = [pose]
+    if optimize_hand_pose:
+        opt_params.append(hand)
+    opt = torch.optim.Adam(opt_params, lr=config.lr)
 
     loss_hist: List[float] = []
     data_loss_hist: List[float] = []
@@ -919,7 +996,7 @@ def run_optimization(
     if config.save_debug_artifacts:
         with torch.no_grad():
             pose_eff0 = pose.detach() * optimize_mask + frozen_pose_target * (1.0 - optimize_mask)
-            out0 = mhr_fk(head, pose_eff0, init_hand, init_scale, init_shape, init_expr, device,
+            out0 = mhr_fk(head, pose_eff0, hand.detach(), init_scale, init_shape, init_expr, device,
                           want_verts=False, want_joint=False, want_model_params=False)
             k70_0 = apply_repo_camera_flip_xyz(out0[1].squeeze(0)[:70])
             predM0 = k70_0[subset_idx]
@@ -933,7 +1010,14 @@ def run_optimization(
             predM0_v = predM0.index_select(0, valid_idx0_t)
             gtM0_v = gtM_t.index_select(0, valid_idx0_t)
             wM0_v = wM0_t.index_select(0, valid_idx0_t)
-            s0, R0, t0 = umeyama_similarity(predM0_v, gtM0_v, w=wM0_v, with_scale=config.with_scale)
+            pred0_align_v, gt0_align_v, w0_align_v = _select_alignment_subset_tensors(
+                predM_v=predM0_v,
+                gtM_v=gtM0_v,
+                wM_v=wM0_v,
+                valid_idx_t=valid_idx0_t,
+                anchor_local_idx_t=anchor_local_idx_t,
+            )
+            s0, R0, t0 = umeyama_similarity(pred0_align_v, gt0_align_v, w=w0_align_v, with_scale=config.with_scale)
             predM0_al = s0 * (predM0_v @ R0.T) + t0[None, :]
             plot_3d_compare(
                 gtM[valid_idx0_t.cpu().numpy()],
@@ -951,13 +1035,14 @@ def run_optimization(
     best_data_loss = float("inf")
     best_iter = -1
     best_pose = pose.detach().clone()
+    best_hand = hand.detach().clone()
     no_improve = 0
     for it in range(config.iters):
         opt.zero_grad(set_to_none=True)
 
         pose_eff = pose * optimize_mask + frozen_pose_target * (1.0 - optimize_mask)
 
-        out = mhr_fk(head, pose_eff, init_hand, init_scale, init_shape, init_expr, device,
+        out = mhr_fk(head, pose_eff, hand, init_scale, init_shape, init_expr, device,
                      want_verts=False, want_joint=False, want_model_params=False)
         k70 = apply_repo_camera_flip_xyz(out[1].squeeze(0)[:70])
         predM = k70[subset_idx]
@@ -975,7 +1060,14 @@ def run_optimization(
         wM_v = wM_masked_t.index_select(0, valid_idx_t)
 
         with torch.no_grad():
-            s, R, t = umeyama_similarity(predM_v.detach(), gtM_v, w=wM_v, with_scale=config.with_scale)
+            pred_align_v, gt_align_v, w_align_v = _select_alignment_subset_tensors(
+                predM_v=predM_v.detach(),
+                gtM_v=gtM_v,
+                wM_v=wM_v,
+                valid_idx_t=valid_idx_t,
+                anchor_local_idx_t=anchor_local_idx_t,
+            )
+            s, R, t = umeyama_similarity(pred_align_v, gt_align_v, w=w_align_v, with_scale=config.with_scale)
 
         predM_aligned = s * (predM_v @ R.T) + t[None, :]
         diff = predM_aligned - gtM_v
@@ -1001,7 +1093,18 @@ def run_optimization(
             loss_temporal_accel = config.w_temporal_accel * torch.mean((cur_vel - prev_vel) ** 2)
         else:
             loss_temporal_accel = torch.zeros((), device=device, dtype=torch.float32)
-        loss = loss_data + loss_reg + loss_temporal + loss_temporal_velocity + loss_temporal_accel
+        if optimize_hand_pose and config.w_hand_reg > 0:
+            loss_hand_reg = config.w_hand_reg * torch.mean((hand - init_hand_ref) ** 2)
+        else:
+            loss_hand_reg = torch.zeros((), device=device, dtype=torch.float32)
+        loss = (
+            loss_data
+            + loss_reg
+            + loss_temporal
+            + loss_temporal_velocity
+            + loss_temporal_accel
+            + loss_hand_reg
+        )
 
         loss.backward()
 
@@ -1009,7 +1112,7 @@ def run_optimization(
             if pose.grad is not None:
                 pose.grad[optimize_mask == 0] = 0.0
 
-        torch.nn.utils.clip_grad_norm_([pose], 1.0)
+        torch.nn.utils.clip_grad_norm_(opt_params, 1.0)
         opt.step()
 
         with torch.no_grad():
@@ -1023,7 +1126,8 @@ def run_optimization(
                 f"data={float(loss_data.detach().cpu().item()):.6f} "
                 f"temporal={float(loss_temporal.detach().cpu().item()):.6f} "
                 f"vel={float(loss_temporal_velocity.detach().cpu().item()):.6f} "
-                f"accel={float(loss_temporal_accel.detach().cpu().item()):.6f}"
+                f"accel={float(loss_temporal_accel.detach().cpu().item()):.6f} "
+                f"hand_reg={float(loss_hand_reg.detach().cpu().item()):.6f}"
             )
 
         cur_loss = loss_hist[-1]
@@ -1032,6 +1136,7 @@ def run_optimization(
             best_loss = cur_loss
             best_iter = it
             best_pose = pose.detach().clone()
+            best_hand = hand.detach().clone()
             no_improve = 0
         else:
             no_improve += 1
@@ -1053,6 +1158,8 @@ def run_optimization(
         with torch.no_grad():
             pose.copy_(best_pose)
             pose.copy_(pose * optimize_mask + frozen_pose_target * (1.0 - optimize_mask))
+            if optimize_hand_pose:
+                hand.copy_(best_hand)
 
     if config.save_debug_artifacts:
         plot_loss_curve(loss_hist, debug_dir / "loss_curve.png")
@@ -1064,7 +1171,7 @@ def run_optimization(
     # final forward (full outputs)
     with torch.no_grad():
         pose_eff = pose.detach() * optimize_mask + frozen_pose_target * (1.0 - optimize_mask)
-        outF = mhr_fk(head, pose_eff, init_hand, init_scale, init_shape, init_expr, device,
+        outF = mhr_fk(head, pose_eff, hand.detach(), init_scale, init_shape, init_expr, device,
                       want_verts=True, want_joint=True, want_model_params=True)
 
         # expected order: verts, keypoints, joint_coords, model_params, joint_rots
@@ -1088,7 +1195,14 @@ def run_optimization(
         gtM_v = gtM_t.index_select(0, valid_idx_t)
         wM_v = wM_masked_t.index_select(0, valid_idx_t)
 
-        fit_s, fit_R, fit_t = umeyama_similarity(predM_v, gtM_v, w=wM_v, with_scale=config.with_scale)
+        pred_align_v, gt_align_v, w_align_v = _select_alignment_subset_tensors(
+            predM_v=predM_v,
+            gtM_v=gtM_v,
+            wM_v=wM_v,
+            valid_idx_t=valid_idx_t,
+            anchor_local_idx_t=anchor_local_idx_t,
+        )
+        fit_s, fit_R, fit_t = umeyama_similarity(pred_align_v, gt_align_v, w=w_align_v, with_scale=config.with_scale)
         out_s, out_R, out_t = fit_s, fit_R, fit_t
         reused_prev_similarity = False
         if (
@@ -1145,12 +1259,19 @@ def run_optimization(
             )
         else:
             final_temporal_accel = 0.0
+        if optimize_hand_pose and config.w_hand_reg > 0:
+            final_hand_reg = float(
+                (config.w_hand_reg * torch.mean((hand - init_hand_ref) ** 2)).detach().cpu().item()
+            )
+        else:
+            final_hand_reg = 0.0
         final_loss = (
             final_data_loss
             + final_reg_loss
             + final_temporal
             + final_temporal_velocity
             + final_temporal_accel
+            + final_hand_reg
         )
 
         rM = residual_subset.cpu().numpy()
@@ -1205,6 +1326,7 @@ def run_optimization(
         # output npy dict in same style as SAM output
         out_dict = dict(init_dict)
         out_dict["body_pose_params"] = (pose_eff.cpu().numpy()).astype(np.float32)
+        out_dict["hand_pose_params"] = (hand.detach().cpu().numpy()).astype(np.float32)
         out_dict["pred_keypoints_3d"] = k70_aligned.cpu().numpy().astype(np.float32)
         out_dict["pred_vertices"] = verts_aligned.cpu().numpy().astype(np.float32)
         out_dict["pred_joint_coords"] = jcoords_aligned.cpu().numpy().astype(np.float32)
@@ -1237,6 +1359,9 @@ def run_optimization(
         out_dict["opt_temporal_weight"] = float(config.w_temporal)
         out_dict["opt_temporal_velocity_weight"] = float(config.w_temporal_velocity)
         out_dict["opt_temporal_accel_weight"] = float(config.w_temporal_accel)
+        out_dict["opt_hand_reg_weight"] = float(config.w_hand_reg)
+        out_dict["opt_optimize_hand_pose"] = int(bool(optimize_hand_pose))
+        out_dict["opt_use_anchor_similarity"] = int(bool(config.use_anchor_similarity))
         out_dict["opt_temporal_extrapolation"] = float(config.temporal_extrapolation)
         out_dict["opt_subset_indices"] = subset_idx
         out_dict["opt_points3d_refined"] = gtM
