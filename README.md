@@ -8,6 +8,56 @@ This repo is now organized as a 3-stage pipeline:
 
 You can run all stages with one command using `run_full_pipeline.py`, or run each stage separately for debugging.
 
+## Export Final MHR-Ready Results
+
+After pipeline optimization, export one frame-per-folder compact result with:
+- `mhr_params.npy` (dict),
+- `mhr_params.npz` (arrays),
+- `mesh.ply` (optional regenerated mesh),
+- `debug_mesh.png` (optional preview).
+
+Frame folder names are preserved from optimization output (for example `0/`, `1/`, ...).
+
+```bash
+python export_mhr_final_results.py \
+  --optimization_root /path/to/pipeline_out/optimization \
+  --output_root /path/to/final_mhr_export \
+  --npy_name opt_out_smoothed.npy \
+  --fallback_npy_name opt_out.npy \
+  --hf_repo facebook/sam-3d-body-dinov3 \
+  --device cuda \
+  --debug_vis
+```
+
+Useful options:
+- `--keep_bad`: export frames marked bad-loss too (default skips them).
+- `--no_run_mhr_forward`: export params only; do not regenerate mesh through MHR forward.
+- `--no_decomposed_params`: export compact-only fields (`mhr_model_params`, `shape_params`, `expr_params`).
+
+### Regenerate Mesh With Official MHR Repo
+
+If you want mesh generation from the official MHR implementation (not SAM head wrapper),
+run this companion step from exported `mhr_params.npz`:
+
+```bash
+python run_mhr_repo_from_export.py \
+  --export_root /path/to/final_mhr_export \
+  --mhr_repo_root /path/to/MHR \
+  --assets_dir /path/to/MHR/assets \
+  --device cuda \
+  --debug_vis
+```
+
+Per frame output (same frame folder structure):
+- `mesh_mhr_repo.ply`
+- `debug_mesh_repo.png` (if `--debug_vis`)
+
+Useful options:
+- `--output_root /path/to/mhr_repo_meshes`: write meshes to another root.
+- `--skip_bad`: skip frames where `is_bad_loss != 0`.
+- `--params_name mhr_params.npz`: change param filename if needed.
+- `--overwrite`: force regenerate existing meshes.
+
 ## V2 Hand-Focused Pipeline (SAM + WiLoR-mini)
 
 For mostly static single-person sequences (for example sign language), use the v2 strategy in `plan_v2.md`:

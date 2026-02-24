@@ -500,6 +500,11 @@ def _recover_missing_and_bad_frames(
     optimized_name: str,
     max_edge_copy_span: int,
 ) -> List[Optional[Dict[str, Any]]]:
+    # Recovery interpolation is pose-only by design.
+    # Non-pose params (scale/shape/expr and other metadata) are copied from
+    # the nearest side dict to avoid synthetic blending of identity-like terms.
+    recovery_interp_keys = ("body_pose_params", "hand_pose_params")
+
     frame_dicts: List[Optional[Dict[str, Any]]] = [None] * len(frame_results)
     valid: List[bool] = [False] * len(frame_results)
 
@@ -559,7 +564,12 @@ def _recover_missing_and_bad_frames(
             if prev_dict is None or next_dict is None:
                 continue
             alpha = float((i - prev_i) / float(next_i - prev_i))
-            recovered = interpolate_frame_dict(prev_dict, next_dict, alpha)
+            recovered = interpolate_frame_dict(
+                prev_dict,
+                next_dict,
+                alpha,
+                keys=recovery_interp_keys,
+            )
             fr.status = "recovered_interpolated"
             fr.recovered_from = f"{frame_results[prev_i].rel_dir}->{frame_results[next_i].rel_dir}"
         elif prev_i is not None:

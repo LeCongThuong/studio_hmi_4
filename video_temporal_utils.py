@@ -9,6 +9,7 @@ import numpy as np
 
 DEFAULT_SMOOTH_KEYS: Sequence[str] = (
     "body_pose_params",
+    "hand_pose_params",
     "pred_keypoints_3d",
     "pred_joint_coords",
 )
@@ -53,11 +54,22 @@ def interpolate_frame_dict(
     prev_dict: Dict[str, Any],
     next_dict: Dict[str, Any],
     alpha: float,
+    keys: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """Interpolate numeric keys that are shape-compatible; copy the rest."""
+    """Interpolate selected numeric keys; copy the rest from nearest side.
+
+    When `keys` is None, all shape-compatible numeric keys are interpolated
+    (legacy behavior). When `keys` is provided, only those keys are blended.
+    """
     a = float(np.clip(alpha, 0.0, 1.0))
     base = dict(prev_dict if a < 0.5 else next_dict)
-    for key in list(base.keys()):
+    if keys is None:
+        iter_keys = list(base.keys())
+    else:
+        iter_keys = list(keys)
+
+    used_keys: List[str] = []
+    for key in iter_keys:
         if key not in prev_dict or key not in next_dict:
             continue
         if not _is_numeric_compatible(prev_dict[key], next_dict[key]):
@@ -65,10 +77,13 @@ def interpolate_frame_dict(
         p = np.asarray(prev_dict[key], dtype=np.float32)
         n = np.asarray(next_dict[key], dtype=np.float32)
         base[key] = ((1.0 - a) * p + a * n).astype(np.float32)
+        used_keys.append(key)
 
     base["opt_recovered"] = int(1)
     base["opt_recovery_mode"] = "interpolate"
     base["opt_recovery_alpha"] = float(a)
+    if keys is not None:
+        base["opt_recovery_interp_keys"] = used_keys
     return base
 
 
