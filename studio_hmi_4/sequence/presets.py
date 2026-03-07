@@ -10,8 +10,8 @@ def public_full_pipeline_defaults() -> Dict[str, Any]:
     return {
         "mhr_py": "mhr70.py",
         "toml_sections": None,
-        "detector_name": "vitdet",
-        "segmentor_name": "sam2",
+        "detector_name": "sam3",
+        "segmentor_name": "sam3",
         "fov_name": "moge2",
         "detector_path": "",
         "segmentor_path": "",

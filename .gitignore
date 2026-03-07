@@ -1,0 +1,24 @@
+# Python bytecode and import caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Coverage outputs
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor and OS cruft
+*.swp
+*.swo
+.DS_Store
