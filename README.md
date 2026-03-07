@@ -8,6 +8,43 @@ This repo is now organized as a 3-stage pipeline:
 
 You can run all stages with one command using `run_full_pipeline.py`, or run each stage separately for debugging.
 
+## Code Layout
+
+The root scripts are thin compatibility wrappers. The implementation lives in the `studio_hmi_4/` package and is now split by responsibility:
+
+- `studio_hmi_4/common/`: contracts, `.npy` I/O, mesh I/O, sorting, shared frame discovery
+- `studio_hmi_4/stage1/`: runner, file/persistence helpers, specialized hand fusion
+- `studio_hmi_4/stage2/`: runner, subset builder, camera rig loader, triangulation/LM solver, debug I/O
+- `studio_hmi_4/stage3/`: runner, optimization pipeline, alignment helpers, runtime/model loading, debug plots
+- `studio_hmi_4/sequence/`: runner, orchestration, frame discovery, recovery policy, summaries, smoothing utilities
+- `studio_hmi_4/export/`: compact export, official-MHR forward, shared export helpers
+- `studio_hmi_4/tools/`: data-preparation utilities
+- `studio_hmi_4/viz/`: viewer tooling
+
+This means the public entrypoints stay stable, but the repo no longer relies on giant single-file stage implementations.
+Resolved full-pipeline settings are written to `pipeline_config.json` in each output root.
+
+## Embedding In `sam-3d-body`
+
+This codebase can be copied into the first-level root of a `sam-3d-body` repository.
+The verified copy workflow and required file list are documented in `docs/integration_guide.md`.
+
+## Synthetic Shape Tests
+
+The repo now includes dependency-light shape/integration tests that use synthetic data and fake runtimes instead of real capture data:
+
+```bash
+python3 -m unittest -v tests.test_synthetic_shapes
+```
+
+These tests verify:
+
+- Stage-1 output contract shapes,
+- Stage-2 triangulation bundle shapes,
+- Stage-3 optimization output shapes,
+- full-pipeline orchestration and recovery wiring,
+- compact export without real MHR forward.
+
 ## Export Final MHR-Ready Results
 
 After pipeline optimization, export one frame-per-folder compact result with:
