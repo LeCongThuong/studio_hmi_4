@@ -117,15 +117,11 @@ python run_full_pipeline.py \
   --output_root /path/to/pipeline_out \
   --cams left front right \
   --caliscope_toml /path/to/config.toml \
-  --mhr_py mhr70.py \
   --checkpoint_path ./checkpoints/sam-3d-body-dinov3/model.ckpt \
   --mhr_path ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt \
   --hf_repo facebook/sam-3d-body-dinov3 \
   --enable_specialized_hand_fusion \
-  --specialized_hand_source precomputed \
-  --specialized_hand_model wilor \
-  --specialized_hand_input_root /path/to/wilor_precomputed \
-  --specialized_hand_debug_vis
+  --specialized_hand_input_root /path/to/wilor_precomputed
 ```
 
 Precomputed hand files are expected as:
@@ -158,40 +154,19 @@ python run_full_pipeline.py \
   --output_root /path/to/pipeline_out \
   --cams left front right \
   --caliscope_toml /path/to/config.toml \
-  --mhr_py mhr70.py \
   --checkpoint_path ./checkpoints/sam-3d-body-dinov3/model.ckpt \
   --mhr_path ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt \
-  --detector_name sam3 \
-  --segmentor_name sam3 \
-  --hf_repo facebook/sam-3d-body-dinov3 \
-  --with_scale
+  --hf_repo facebook/sam-3d-body-dinov3
 ```
 
 ### Useful Flags
 
 - `--frame_rel 100`: run only one frame subfolder under inferred `npy` root.
-- `--skip_inference --npy_root /path/to/existing/npy`: reuse stage-1 outputs.
-- `--skip_triangulation`: reuse existing triangulation files under `output_root/triangulation`.
-- `--skip_optimization`: stop after triangulation.
-- `--save_mhr_params`: save extracted MHR params from stage-1 under `inference/mhr_params`.
-- `--person_select_strategy largest_bbox`: choose stage-1 person selection mode (`first`, `largest_bbox`, `person_index`).
-- `--person_index 0`: used only with `--person_select_strategy person_index`.
-- `--specialized_hand_debug_vis --specialized_hand_debug_dirname specialized_hand_debug`: save stage-1 overlays comparing SAM hand points (before) vs specialized replacements (after).
-- `--save_triangulation_debug`: save overlay debug images for triangulation.
-- `--debug_inference` / `--debug_triangulation`: interactive/debug rendering for stage-1/stage-2.
-- For multi-frame runs, `--debug_triangulation` opens interactive 3D only on the first frame by default.
-- `--debug_triangulation_every_frame`: force interactive 3D popup on every frame.
 - `--min_views 2`: minimum available views for each frame optimization.
-- `--bad_loss_threshold 3e-5 --bad_data_loss_threshold 2e-5`: stricter bad-frame gate for non-human pose prevention.
-- `--bad_frame_max_retries 2`: retry bad frames with stronger temporal constraints.
-- `--max_stale_temporal_frames 40`: disable temporal priors after long non-good streaks to avoid stale-pose lock-in.
-- `--max_edge_recovery_copy_span 15`: cap one-sided recovery copy distance so long bad tails are not flattened to one repeated pose.
 - `--fixed_mhr_param_frame_idx <idx> --fixed_mhr_param_cam front`: lock non-pose MHR params (`hand/scale/shape/expr`) to one reference frame+camera across the sequence (useful for single-person videos to avoid body-size drift).
-- Reused optimization files that were recovered now keep a recovered status in summaries (not `ok`) and no longer report copied loss metrics as if they were fresh optimization results.
-- `--min_valid_points 6 --zero_weight_strategy uniform_finite`: robust stage-3 valid-point/weight controls.
 - `--freeze_lower_body`: lock lower-body dimensions and (for sequence runs) reuse previous-frame similarity alignment for lower-body world stability.
-- `--smoothing_alpha 0.65 --smoothing_median_window 5 --smoothing_outlier_sigma 3.5`: sequence smoothing controls.
-- `--debug_4d --save_4d_mp4`: interactive 4D playback + MP4 export aliases.
+- `--enable_specialized_hand_fusion --specialized_hand_input_root /path/to/wilor_precomputed`: use precomputed WiLoR hand keypoints in stage-1 fusion.
+- `--save_sequence_mp4`: export sequence debug MP4.
 
 ### Recommended settings for hand-focused mostly-static sequences
 
@@ -201,8 +176,7 @@ python run_full_pipeline.py \
 - Keep lower body stable:
   - `--freeze_lower_body`
 - Keep interpolation enabled for failure recovery:
-  - keep sequence recovery on,
-  - use bounded one-sided copy (`--max_edge_recovery_copy_span` small).
+  - recovery and smoothing are always on in the v2 pipeline.
 - Follow `plan_v2.md` for the no-retry bad-frame policy and specialized hand fusion path.
 
 ## Output Structure
@@ -212,11 +186,7 @@ python run_full_pipeline.py \
 - `inference/`
 - `inference/npy/...` per-camera SAM outputs
 - `inference/stage1_meta.json` stage-1 cache contract metadata
-- `inference/render/...` and `inference/mesh/...` if `--debug_inference`
-- `inference/specialized_hand_debug/...` (or custom `--specialized_hand_debug_dirname`) if `--specialized_hand_debug_vis`
-- `inference/mhr_params/...` if `--save_mhr_params`
 - `triangulation/.../triangulated.npz`
-- `triangulation/.../debug/` if `--save_triangulation_debug`
 - `optimization/.../opt_out.npy`
 - `optimization/.../opt_out_smoothed.npy` (if smoothing enabled)
 - `optimization/.../debug_opt/`

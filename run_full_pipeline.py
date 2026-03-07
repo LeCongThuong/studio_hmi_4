@@ -40,7 +40,6 @@ from video_temporal_utils import (
     load_npy_dict,
     save_keypoint_sequence_mp4,
     save_npy_dict,
-    show_keypoint_sequence_interactive,
     smooth_frame_dict_sequence,
 )
 
@@ -84,9 +83,6 @@ class FullPipelineConfig:
     wilor_pretrained_dir: str = ""
     wilor_repo_id: str = "warmshao/WiLoR-mini"
     frame_rel: Optional[str] = None
-    skip_inference: bool = False
-    skip_triangulation: bool = False
-    skip_optimization: bool = False
     overwrite: bool = False
     npy_root: Optional[str] = None
     triangulated_name: str = "triangulated.npz"
@@ -102,8 +98,6 @@ class FullPipelineConfig:
     inlier_thresh: float = 30.0
     robust_lm: bool = False
     robust_lm_delta: float = 10.0
-    debug_triangulation: bool = False
-    debug_triangulation_every_frame: bool = False
     save_triangulation_debug: bool = False
     hf_repo: Optional[str] = None
     opt_ckpt: Optional[str] = None
@@ -133,10 +127,7 @@ class FullPipelineConfig:
     freeze_lower_body: bool = False
     topk_print: int = 10
     save_opt_debug: bool = False
-    bad_frame_max_retries: int = 0
     min_views: int = 2
-    recover_bad_frames: bool = True
-    fill_missing_frames: bool = True
     max_stale_temporal_frames: int = 40
     max_edge_recovery_copy_span: int = 15
     enable_smoothing: bool = True
@@ -144,7 +135,6 @@ class FullPipelineConfig:
     smoothing_median_window: int = 5
     smoothing_outlier_sigma: float = 3.5
     smoothed_name: str = "opt_out_smoothed.npy"
-    debug_sequence: bool = False
     save_sequence_mp4: bool = False
     sequence_mp4_name: str = "sequence_debug.mp4"
     sequence_fps: int = 20
@@ -488,7 +478,7 @@ def _push_temporal_pose_history(
 def _stale_frame_run_length(frame_results: Sequence[FramePipelineResult]) -> int:
     stale = 0
     for fr in reversed(frame_results):
-        if (fr.status in {"ok", "recovered_retry"}) and (not fr.is_bad_loss):
+        if (fr.status == "ok") and (not fr.is_bad_loss):
             break
         stale += 1
     return stale
@@ -516,7 +506,7 @@ def _recover_missing_and_bad_frames(
         except Exception:
             continue
         frame_dicts[i] = d
-        valid[i] = (fr.status in {"ok", "recovered_retry"}) and (not fr.is_bad_loss)
+        valid[i] = (fr.status == "ok") and (not fr.is_bad_loss)
 
     for i, fr in enumerate(frame_results):
         need_recover = (
@@ -682,59 +672,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--output_root", required=True, type=str, help="Pipeline output root.")
     ap.add_argument("--cams", nargs="+", required=True, help="Camera names (file stems), e.g. left front right.")
     ap.add_argument("--caliscope_toml", required=True, type=str, help="Path to Caliscope TOML.")
-    ap.add_argument("--mhr_py", default="mhr70.py", type=str, help="Path to mhr70.py with pose_info.")
-    ap.add_argument(
-        "--toml_sections",
-        nargs="*",
-        default=None,
-        help="Optional TOML section names aligned with --cams.",
-    )
+    ap.add_argument("--checkpoint_path", required=True, type=str, help="SAM-3D checkpoint for stage-1.")
+    ap.add_argument("--mhr_path", required=True, type=str, help="MHR model path for stage-1.")
 
-    # Stage 1: SAM 3D body inference
-    ap.add_argument("--checkpoint_path", default="", type=str, help="SAM-3D checkpoint (required unless --skip_inference).")
-    ap.add_argument("--mhr_path", default="", type=str, help="MHR model path for inference.")
-    ap.add_argument("--detector_name", default="vitdet", type=str)
-    ap.add_argument("--segmentor_name", default="sam2", type=str)
-    ap.add_argument("--fov_name", default="moge2", type=str)
-    ap.add_argument("--detector_path", default="", type=str)
-    ap.add_argument("--segmentor_path", default="", type=str)
-    ap.add_argument("--fov_path", default="", type=str)
-    ap.add_argument("--bbox_thresh", default=0.8, type=float)
-    ap.add_argument("--use_mask", action="store_true", default=False)
-    ap.add_argument("--debug_inference", action="store_true", default=False)
-    ap.add_argument("--save_mhr_params", action="store_true", default=False)
-    ap.add_argument(
-        "--person_select_strategy",
-        type=str,
-        default="largest_bbox",
-        choices=["first", "largest_bbox", "person_index"],
-        help="How stage-1 selects one person if multiple are detected.",
-    )
-    ap.add_argument(
-        "--person_index",
-        type=int,
-        default=0,
-        help="Person index used when --person_select_strategy=person_index.",
-    )
+    grp = ap.add_mutually_exclusive_group(required=False)
+    grp.add_argument("--hf_repo", type=str, default=None)
+    grp.add_argument("--opt_ckpt", type=str, default=None)
+    ap.add_argument("--opt_mhr_pt", type=str, default="", help="MHR model path when using --opt_ckpt.")
+    ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+
+    ap.add_argument("--frame_rel", default=None, type=str, help="Optional relative frame dir under inferred npy root.")
+    ap.add_argument("--overwrite", action="store_true", default=False, help="Recompute outputs even when they already exist.")
+    ap.add_argument("--min_views", type=int, default=2, help="Minimum available views required per frame.")
+
     ap.add_argument(
         "--enable_specialized_hand_fusion",
         action="store_true",
         default=False,
         help="Enable specialized hand-model fusion into stage-1 pred_keypoints_2d.",
-    )
-    ap.add_argument(
-        "--specialized_hand_source",
-        type=str,
-        default="precomputed",
-        choices=["precomputed", "live"],
-        help="Source of specialized hand keypoints used in stage-1 fusion.",
-    )
-    ap.add_argument(
-        "--specialized_hand_model",
-        type=str,
-        default="none",
-        choices=["none", "wilor"],
-        help="Specialized hand model to use in stage-1 fusion.",
     )
     ap.add_argument(
         "--specialized_hand_input_root",
@@ -746,169 +701,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     ap.add_argument(
-        "--specialized_hand_device",
-        type=str,
-        default="cuda",
-        choices=["cuda", "cpu"],
-        help="Device for specialized hand model inference.",
-    )
-    ap.add_argument("--specialized_hand_detector_conf", type=float, default=0.3)
-    ap.add_argument("--specialized_hand_rescale_factor", type=float, default=2.5)
-    ap.add_argument("--specialized_hand_wrist_max_dist_px", type=float, default=140.0)
-    ap.add_argument(
-        "--replace_wrist_with_specialized",
-        action="store_true",
-        default=False,
-        help="Also replace wrists with specialized model output (default keeps SAM wrists).",
-    )
-    ap.add_argument(
-        "--specialized_hand_debug_vis",
-        action="store_true",
-        default=False,
-        help="Save SAM-vs-specialized hand fusion overlays during stage-1.",
-    )
-    ap.add_argument(
-        "--specialized_hand_debug_dirname",
-        type=str,
-        default="specialized_hand_debug",
-        help="Subfolder under stage-1 output root used for fusion debug images.",
-    )
-    ap.add_argument("--specialized_hand_verbose", action="store_true", default=False)
-    ap.add_argument("--wilor_pretrained_dir", type=str, default="")
-    ap.add_argument("--wilor_repo_id", type=str, default="warmshao/WiLoR-mini")
-
-    # Pipeline control
-    ap.add_argument("--frame_rel", default=None, type=str, help="Optional relative frame dir under npy root.")
-    ap.add_argument("--skip_inference", action="store_true", default=False)
-    ap.add_argument("--skip_triangulation", action="store_true", default=False)
-    ap.add_argument("--skip_optimization", action="store_true", default=False)
-    ap.add_argument("--overwrite", action="store_true", default=False, help="Recompute outputs even when they already exist.")
-    ap.add_argument("--npy_root", default=None, type=str, help="Existing npy root (used when --skip_inference).")
-    ap.add_argument("--triangulated_name", default="triangulated.npz", type=str)
-    ap.add_argument("--optimized_name", default="opt_out.npy", type=str)
-    ap.add_argument("--min_views", type=int, default=2, help="Minimum available views required per frame.")
-    ap.add_argument("--no_recover_bad_frames", action="store_true", help="Disable recovery for bad/failed frames.")
-    ap.add_argument("--no_fill_missing_frames", action="store_true", help="Disable insertion of missing numeric frame folders.")
-    ap.add_argument(
-        "--max_stale_temporal_frames",
-        type=int,
-        default=40,
-        help="Disable temporal init/priors after this many consecutive non-good frames (0 disables this safeguard).",
-    )
-    ap.add_argument(
-        "--max_edge_recovery_copy_span",
-        type=int,
-        default=15,
-        help="Max frame distance for one-sided recovery copy (copy_prev/copy_next). Larger gaps stay unrecovered.",
-    )
-
-    # Stage 2: Triangulation + BA
-    ap.add_argument("--normalized", action="store_true", default=False)
-    ap.add_argument("--pixel", action="store_true", default=False)
-    ap.add_argument("--invert_extrinsics", action="store_true", default=False)
-    ap.add_argument("--lm_iters", type=int, default=25)
-    ap.add_argument("--lm_lambda", type=float, default=1e-3)
-    ap.add_argument("--lm_eps", type=float, default=1e-4)
-    ap.add_argument("--score_type", type=str, default="median", choices=["median", "trimmed", "huber"])
-    ap.add_argument("--huber_delta", type=float, default=10.0)
-    ap.add_argument("--inlier_thresh", type=float, default=30.0)
-    ap.add_argument("--robust_lm", action="store_true", default=False)
-    ap.add_argument("--robust_lm_delta", type=float, default=10.0)
-    ap.add_argument("--debug_triangulation", action="store_true", default=False, help="Interactive 3D display.")
-    ap.add_argument(
-        "--debug_triangulation_every_frame",
-        action="store_true",
-        default=False,
-        help="When --debug_triangulation is enabled, show interactive 3D window for every frame (default: first frame only).",
-    )
-    ap.add_argument("--save_triangulation_debug", action="store_true", default=False, help="Save per-frame overlay debug.")
-
-    # Stage 3: Optimization
-    grp = ap.add_mutually_exclusive_group(required=False)
-    grp.add_argument("--hf_repo", type=str, default=None)
-    grp.add_argument("--opt_ckpt", type=str, default=None)
-    ap.add_argument("--opt_mhr_pt", type=str, default="")
-    ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
-    ap.add_argument("--iters", type=int, default=200)
-    ap.add_argument("--lr", type=float, default=5e-2)
-    ap.add_argument("--with_scale", action="store_true")
-    ap.add_argument("--huber_m", type=float, default=0.03)
-    ap.add_argument("--w_pose_reg", type=float, default=1e-3)
-    ap.add_argument("--w_hand_reg", type=float, default=1e-3)
-    ap.add_argument("--w_temporal", type=float, default=3e-3)
-    ap.add_argument("--w_temporal_velocity", type=float, default=0.0)
-    ap.add_argument("--w_temporal_accel", type=float, default=0.0)
-    ap.add_argument("--temporal_init_blend", type=float, default=0.7)
-    ap.add_argument("--temporal_extrapolation", type=float, default=1.0)
-    ap.add_argument(
         "--fixed_mhr_param_frame_idx",
         type=int,
         default=None,
-        help=(
-            "Optional frame index used as fixed source for non-pose MHR params "
-            "(scale/shape/expr) across the whole sequence. "
-            "Hand pose can also be fixed by adding --fixed_hand_pose_from_reference."
-        ),
+        help="Optional frame index used as fixed source for non-pose MHR params (scale/shape/expr).",
     )
     ap.add_argument(
         "--fixed_mhr_param_cam",
         type=str,
         default="front",
-        help=(
-            "Camera name used to read fixed non-pose MHR params from "
-            "--fixed_mhr_param_frame_idx."
-        ),
-    )
-    ap.add_argument(
-        "--fixed_hand_pose_from_reference",
-        action="store_true",
-        default=False,
-        help="Also fix hand_pose_params from reference frame/camera (disabled by default in v2).",
-    )
-    ap.add_argument(
-        "--no_optimize_hand_pose",
-        action="store_true",
-        default=False,
-        help="Disable hand108 optimization (v2 default is to optimize hand pose).",
-    )
-    ap.add_argument(
-        "--no_anchor_similarity",
-        action="store_true",
-        default=False,
-        help="Disable anchor-only similarity alignment (fallback to all supervised points).",
-    )
-    ap.add_argument("--bad_loss_threshold", type=float, default=3e-5)
-    ap.add_argument("--bad_data_loss_threshold", type=float, default=2e-5)
-    ap.add_argument("--bad_loss_growth_ratio", type=float, default=1.5)
-    ap.add_argument("--min_valid_points", type=int, default=6)
-    ap.add_argument(
-        "--zero_weight_strategy",
-        type=str,
-        choices=["uniform_finite", "fail"],
-        default="uniform_finite",
+        help="Camera name used to read fixed non-pose MHR params from --fixed_mhr_param_frame_idx.",
     )
     ap.add_argument(
         "--freeze_lower_body",
         action="store_true",
         help="Freeze lower-body pose dimensions in stage-3 optimization.",
     )
-    ap.add_argument("--bad_frame_max_retries", type=int, default=0)
-    ap.add_argument("--topk_print", type=int, default=10)
-    ap.add_argument("--save_opt_debug", action="store_true", default=False, help="Save optimization debug plots/artifacts.")
-
-    # Sequence post-process and debug
-    ap.add_argument("--disable_smoothing", action="store_true", help="Disable temporal smoothing module.")
-    ap.add_argument("--smoothing_alpha", type=float, default=0.65)
-    ap.add_argument("--smoothing_median_window", type=int, default=5)
-    ap.add_argument("--smoothing_outlier_sigma", type=float, default=3.5)
-    ap.add_argument("--smoothed_name", type=str, default="opt_out_smoothed.npy")
-    ap.add_argument("--debug_sequence", action="store_true", help="Show interactive 4D keypoint motion viewer.")
-    ap.add_argument("--debug_4d", action="store_true", help="Alias of --debug_sequence.")
     ap.add_argument("--save_sequence_mp4", action="store_true", help="Export sequence debug MP4.")
-    ap.add_argument("--save_4d_mp4", action="store_true", help="Alias of --save_sequence_mp4.")
-    ap.add_argument("--sequence_mp4_name", type=str, default="sequence_debug.mp4")
-    ap.add_argument("--sequence_fps", type=int, default=20)
-    ap.add_argument("--no_summary_json", action="store_true", help="Disable writing sequence_summary.json.")
     return ap
 
 
@@ -944,114 +753,101 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
     if not isinstance(cams, (list, tuple)):
         raise AttributeError("Argument --cams must be a sequence of camera names.")
 
-    debug_sequence = bool(
-        getattr(args, "debug_sequence", False) or getattr(args, "debug_4d", False)
-    )
-    save_sequence_mp4 = bool(
-        getattr(args, "save_sequence_mp4", False) or getattr(args, "save_4d_mp4", False)
-    )
+    enable_hand_fusion = bool(getattr(args, "enable_specialized_hand_fusion", False))
+    hand_model = "wilor" if enable_hand_fusion else "none"
 
     return FullPipelineConfig(
         image_folder=str(image_folder),
         output_root=str(output_root),
         cams=list(cams),
         caliscope_toml=str(caliscope_toml),
-        mhr_py=getattr(args, "mhr_py", "mhr70.py"),
-        toml_sections=getattr(args, "toml_sections", None),
-        checkpoint_path=getattr(args, "checkpoint_path", ""),
-        mhr_path=getattr(args, "mhr_path", ""),
-        detector_name=getattr(args, "detector_name", "vitdet"),
-        segmentor_name=getattr(args, "segmentor_name", "sam2"),
-        fov_name=getattr(args, "fov_name", "moge2"),
-        detector_path=getattr(args, "detector_path", ""),
-        segmentor_path=getattr(args, "segmentor_path", ""),
-        fov_path=getattr(args, "fov_path", ""),
-        bbox_thresh=float(getattr(args, "bbox_thresh", 0.8)),
-        use_mask=bool(getattr(args, "use_mask", False)),
-        debug_inference=bool(getattr(args, "debug_inference", False)),
-        save_mhr_params=bool(getattr(args, "save_mhr_params", False)),
-        person_select_strategy=getattr(args, "person_select_strategy", "largest_bbox"),
-        person_index=int(getattr(args, "person_index", 0)),
-        enable_specialized_hand_fusion=bool(getattr(args, "enable_specialized_hand_fusion", False)),
-        specialized_hand_source=str(getattr(args, "specialized_hand_source", "precomputed")),
-        specialized_hand_model=str(getattr(args, "specialized_hand_model", "none")),
+        mhr_py="mhr70.py",
+        toml_sections=None,
+        checkpoint_path=str(getattr(args, "checkpoint_path", "")),
+        mhr_path=str(getattr(args, "mhr_path", "")),
+        detector_name="vitdet",
+        segmentor_name="sam2",
+        fov_name="moge2",
+        detector_path="",
+        segmentor_path="",
+        fov_path="",
+        bbox_thresh=0.8,
+        use_mask=False,
+        debug_inference=False,
+        save_mhr_params=False,
+        person_select_strategy="largest_bbox",
+        person_index=0,
+        enable_specialized_hand_fusion=enable_hand_fusion,
+        specialized_hand_source="precomputed",
+        specialized_hand_model=hand_model,
         specialized_hand_input_root=str(getattr(args, "specialized_hand_input_root", "")),
-        specialized_hand_device=str(getattr(args, "specialized_hand_device", "cuda")),
-        specialized_hand_detector_conf=float(getattr(args, "specialized_hand_detector_conf", 0.3)),
-        specialized_hand_rescale_factor=float(getattr(args, "specialized_hand_rescale_factor", 2.5)),
-        specialized_hand_wrist_max_dist_px=float(getattr(args, "specialized_hand_wrist_max_dist_px", 140.0)),
-        replace_wrist_with_specialized=bool(getattr(args, "replace_wrist_with_specialized", False)),
-        specialized_hand_debug_vis=bool(getattr(args, "specialized_hand_debug_vis", False)),
-        specialized_hand_debug_dirname=str(getattr(args, "specialized_hand_debug_dirname", "specialized_hand_debug")),
-        specialized_hand_verbose=bool(getattr(args, "specialized_hand_verbose", False)),
-        wilor_pretrained_dir=str(getattr(args, "wilor_pretrained_dir", "")),
-        wilor_repo_id=str(getattr(args, "wilor_repo_id", "warmshao/WiLoR-mini")),
+        specialized_hand_device="cuda",
+        specialized_hand_detector_conf=0.3,
+        specialized_hand_rescale_factor=2.5,
+        specialized_hand_wrist_max_dist_px=140.0,
+        replace_wrist_with_specialized=False,
+        specialized_hand_debug_vis=False,
+        specialized_hand_debug_dirname="specialized_hand_debug",
+        specialized_hand_verbose=False,
+        wilor_pretrained_dir="",
+        wilor_repo_id="warmshao/WiLoR-mini",
         frame_rel=getattr(args, "frame_rel", None),
-        skip_inference=bool(getattr(args, "skip_inference", False)),
-        skip_triangulation=bool(getattr(args, "skip_triangulation", False)),
-        skip_optimization=bool(getattr(args, "skip_optimization", False)),
         overwrite=bool(getattr(args, "overwrite", False)),
-        npy_root=getattr(args, "npy_root", None),
-        triangulated_name=getattr(args, "triangulated_name", "triangulated.npz"),
-        optimized_name=getattr(args, "optimized_name", "opt_out.npy"),
-        normalized=bool(getattr(args, "normalized", False)),
-        pixel=bool(getattr(args, "pixel", False)),
-        invert_extrinsics=bool(getattr(args, "invert_extrinsics", False)),
-        lm_iters=int(getattr(args, "lm_iters", 25)),
-        lm_lambda=float(getattr(args, "lm_lambda", 1e-3)),
-        lm_eps=float(getattr(args, "lm_eps", 1e-4)),
-        score_type=getattr(args, "score_type", "median"),
-        huber_delta=float(getattr(args, "huber_delta", 10.0)),
-        inlier_thresh=float(getattr(args, "inlier_thresh", 30.0)),
-        robust_lm=bool(getattr(args, "robust_lm", False)),
-        robust_lm_delta=float(getattr(args, "robust_lm_delta", 10.0)),
-        debug_triangulation=bool(getattr(args, "debug_triangulation", False)),
-        debug_triangulation_every_frame=bool(getattr(args, "debug_triangulation_every_frame", False)),
-        save_triangulation_debug=bool(getattr(args, "save_triangulation_debug", False)),
+        npy_root=None,
+        triangulated_name="triangulated.npz",
+        optimized_name="opt_out.npy",
+        normalized=False,
+        pixel=False,
+        invert_extrinsics=False,
+        lm_iters=25,
+        lm_lambda=1e-3,
+        lm_eps=1e-4,
+        score_type="median",
+        huber_delta=10.0,
+        inlier_thresh=30.0,
+        robust_lm=False,
+        robust_lm_delta=10.0,
+        save_triangulation_debug=False,
         hf_repo=getattr(args, "hf_repo", None),
         opt_ckpt=getattr(args, "opt_ckpt", None),
-        opt_mhr_pt=getattr(args, "opt_mhr_pt", ""),
+        opt_mhr_pt=str(getattr(args, "opt_mhr_pt", "")),
         device=getattr(args, "device", "cuda"),
-        iters=int(getattr(args, "iters", 200)),
-        lr=float(getattr(args, "lr", 5e-2)),
-        with_scale=bool(getattr(args, "with_scale", False)),
-        huber_m=float(getattr(args, "huber_m", 0.03)),
-        w_pose_reg=float(getattr(args, "w_pose_reg", 1e-3)),
-        w_hand_reg=float(getattr(args, "w_hand_reg", 1e-3)),
-        w_temporal=float(getattr(args, "w_temporal", 3e-3)),
-        w_temporal_velocity=float(getattr(args, "w_temporal_velocity", 0.0)),
-        w_temporal_accel=float(getattr(args, "w_temporal_accel", 0.0)),
-        temporal_init_blend=float(getattr(args, "temporal_init_blend", 0.7)),
-        temporal_extrapolation=float(getattr(args, "temporal_extrapolation", 1.0)),
+        iters=200,
+        lr=5e-2,
+        with_scale=False,
+        huber_m=0.03,
+        w_pose_reg=1e-3,
+        w_hand_reg=1e-3,
+        w_temporal=3e-3,
+        w_temporal_velocity=0.0,
+        w_temporal_accel=0.0,
+        temporal_init_blend=0.7,
+        temporal_extrapolation=1.0,
         fixed_mhr_param_frame_idx=getattr(args, "fixed_mhr_param_frame_idx", None),
         fixed_mhr_param_cam=str(getattr(args, "fixed_mhr_param_cam", "front")),
-        fixed_hand_pose_from_reference=bool(getattr(args, "fixed_hand_pose_from_reference", False)),
-        optimize_hand_pose=not bool(getattr(args, "no_optimize_hand_pose", False)),
-        use_anchor_similarity=not bool(getattr(args, "no_anchor_similarity", False)),
-        bad_loss_threshold=float(getattr(args, "bad_loss_threshold", 3e-5)),
-        bad_data_loss_threshold=float(getattr(args, "bad_data_loss_threshold", 2e-5)),
-        bad_loss_growth_ratio=float(getattr(args, "bad_loss_growth_ratio", 1.5)),
-        min_valid_points=int(getattr(args, "min_valid_points", 6)),
-        zero_weight_strategy=getattr(args, "zero_weight_strategy", "uniform_finite"),
+        fixed_hand_pose_from_reference=False,
+        optimize_hand_pose=True,
+        use_anchor_similarity=True,
+        bad_loss_threshold=3e-5,
+        bad_data_loss_threshold=2e-5,
+        bad_loss_growth_ratio=1.5,
+        min_valid_points=6,
+        zero_weight_strategy="uniform_finite",
         freeze_lower_body=bool(getattr(args, "freeze_lower_body", False)),
-        topk_print=int(getattr(args, "topk_print", 10)),
-        save_opt_debug=bool(getattr(args, "save_opt_debug", False)),
-        bad_frame_max_retries=int(getattr(args, "bad_frame_max_retries", 0)),
+        topk_print=10,
+        save_opt_debug=False,
         min_views=int(getattr(args, "min_views", 2)),
-        recover_bad_frames=not bool(getattr(args, "no_recover_bad_frames", False)),
-        fill_missing_frames=not bool(getattr(args, "no_fill_missing_frames", False)),
-        max_stale_temporal_frames=int(getattr(args, "max_stale_temporal_frames", 40)),
-        max_edge_recovery_copy_span=int(getattr(args, "max_edge_recovery_copy_span", 15)),
-        enable_smoothing=not bool(getattr(args, "disable_smoothing", False)),
-        smoothing_alpha=float(getattr(args, "smoothing_alpha", 0.65)),
-        smoothing_median_window=int(getattr(args, "smoothing_median_window", 5)),
-        smoothing_outlier_sigma=float(getattr(args, "smoothing_outlier_sigma", 3.5)),
-        smoothed_name=getattr(args, "smoothed_name", "opt_out_smoothed.npy"),
-        debug_sequence=debug_sequence,
-        save_sequence_mp4=save_sequence_mp4,
-        sequence_mp4_name=getattr(args, "sequence_mp4_name", "sequence_debug.mp4"),
-        sequence_fps=int(getattr(args, "sequence_fps", 20)),
-        save_summary_json=not bool(getattr(args, "no_summary_json", False)),
+        max_stale_temporal_frames=40,
+        max_edge_recovery_copy_span=15,
+        enable_smoothing=True,
+        smoothing_alpha=0.65,
+        smoothing_median_window=5,
+        smoothing_outlier_sigma=3.5,
+        smoothed_name="opt_out_smoothed.npy",
+        save_sequence_mp4=bool(getattr(args, "save_sequence_mp4", False)),
+        sequence_mp4_name="sequence_debug.mp4",
+        sequence_fps=20,
+        save_summary_json=True,
     )
 
 
@@ -1065,93 +861,84 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
     optimization_root = output_root / "optimization"
     output_root.mkdir(parents=True, exist_ok=True)
 
-    if not config.skip_inference and not config.checkpoint_path:
-        raise ValueError("--checkpoint_path is required unless --skip_inference is set.")
+    if not config.checkpoint_path:
+        raise ValueError("--checkpoint_path is required.")
 
     min_views = max(2, int(config.min_views))
     cam_to_section = _cam_to_section_map(config.cams, config.toml_sections)
 
     opt_ckpt = config.opt_ckpt or (config.checkpoint_path if not config.hf_repo else None)
     opt_mhr_pt = config.opt_mhr_pt or config.mhr_path
-    if not config.skip_optimization and not (config.hf_repo or opt_ckpt):
+    if not (config.hf_repo or opt_ckpt):
         raise ValueError("Optimization requires --hf_repo or --opt_ckpt.")
 
-    if config.skip_inference:
-        npy_root = (
-            Path(config.npy_root).expanduser().resolve()
-            if config.npy_root
-            else (inference_root / "npy").resolve()
+    inferred_npy_root = (inference_root / "npy").resolve()
+    stage1_meta_path = (inference_root / "stage1_meta.json").resolve()
+    expected_stage1_meta = _expected_stage1_meta(config=config, image_root=image_root)
+    reuse_stage1 = False
+    if (
+        not config.overwrite
+        and config.frame_rel is not None
+        and inferred_npy_root.is_dir()
+    ):
+        rel_dir_path = (inferred_npy_root / config.frame_rel).resolve()
+        meta_matches = _stage1_meta_matches(
+            existing_meta=_load_stage1_meta(stage1_meta_path),
+            expected_meta=expected_stage1_meta,
         )
-        if not npy_root.is_dir():
-            raise FileNotFoundError(f"Numpy root not found: {npy_root}")
-    else:
-        inferred_npy_root = (inference_root / "npy").resolve()
-        stage1_meta_path = (inference_root / "stage1_meta.json").resolve()
-        expected_stage1_meta = _expected_stage1_meta(config=config, image_root=image_root)
-        reuse_stage1 = False
         if (
-            not config.overwrite
-            and config.frame_rel is not None
-            and inferred_npy_root.is_dir()
+            rel_dir_path.is_dir()
+            and _dir_has_min_cam_predictions(rel_dir_path, config.cams, min_views=min_views)
+            and meta_matches
         ):
-            rel_dir_path = (inferred_npy_root / config.frame_rel).resolve()
-            meta_matches = _stage1_meta_matches(
-                existing_meta=_load_stage1_meta(stage1_meta_path),
-                expected_meta=expected_stage1_meta,
-            )
-            if (
-                rel_dir_path.is_dir()
-                and _dir_has_min_cam_predictions(rel_dir_path, config.cams, min_views=min_views)
-                and meta_matches
-            ):
-                reuse_stage1 = True
+            reuse_stage1 = True
 
-        if reuse_stage1:
-            npy_root = inferred_npy_root
-            print(f"[PIPELINE] Reusing existing stage-1 outputs at: {npy_root}")
-        else:
-            demo_cfg = Demo2Config(
-                image_folder=str(image_root),
-                output_folder=str(inference_root),
-                checkpoint_path=config.checkpoint_path,
-                detector_name=config.detector_name,
-                segmentor_name=config.segmentor_name,
-                fov_name=config.fov_name,
-                detector_path=config.detector_path,
-                segmentor_path=config.segmentor_path,
-                fov_path=config.fov_path,
-                mhr_path=config.mhr_path,
-                bbox_thresh=config.bbox_thresh,
-                use_mask=config.use_mask,
-                debug=config.debug_inference,
-                save_mhr_params=config.save_mhr_params,
-                include_rel_dirs=[config.frame_rel] if config.frame_rel else None,
-                person_select_strategy=config.person_select_strategy,
-                person_index=config.person_index,
-                enable_specialized_hand_fusion=config.enable_specialized_hand_fusion,
-                specialized_hand_source=config.specialized_hand_source,
-                specialized_hand_model=config.specialized_hand_model,
-                specialized_hand_input_root=config.specialized_hand_input_root,
-                specialized_hand_device=config.specialized_hand_device,
-                specialized_hand_detector_conf=config.specialized_hand_detector_conf,
-                specialized_hand_rescale_factor=config.specialized_hand_rescale_factor,
-                specialized_hand_wrist_max_dist_px=config.specialized_hand_wrist_max_dist_px,
-                replace_wrist_with_specialized=config.replace_wrist_with_specialized,
-                specialized_hand_debug_vis=config.specialized_hand_debug_vis,
-                specialized_hand_debug_dirname=config.specialized_hand_debug_dirname,
-                specialized_hand_verbose=config.specialized_hand_verbose,
-                wilor_pretrained_dir=config.wilor_pretrained_dir,
-                wilor_repo_id=config.wilor_repo_id,
-            )
-            demo_result = run_demo(demo_cfg)
-            npy_root = demo_result.npy_root.resolve()
+    if reuse_stage1:
+        npy_root = inferred_npy_root
+        print(f"[PIPELINE] Reusing existing stage-1 outputs at: {npy_root}")
+    else:
+        demo_cfg = Demo2Config(
+            image_folder=str(image_root),
+            output_folder=str(inference_root),
+            checkpoint_path=config.checkpoint_path,
+            detector_name=config.detector_name,
+            segmentor_name=config.segmentor_name,
+            fov_name=config.fov_name,
+            detector_path=config.detector_path,
+            segmentor_path=config.segmentor_path,
+            fov_path=config.fov_path,
+            mhr_path=config.mhr_path,
+            bbox_thresh=config.bbox_thresh,
+            use_mask=config.use_mask,
+            debug=config.debug_inference,
+            save_mhr_params=config.save_mhr_params,
+            include_rel_dirs=[config.frame_rel] if config.frame_rel else None,
+            person_select_strategy=config.person_select_strategy,
+            person_index=config.person_index,
+            enable_specialized_hand_fusion=config.enable_specialized_hand_fusion,
+            specialized_hand_source=config.specialized_hand_source,
+            specialized_hand_model=config.specialized_hand_model,
+            specialized_hand_input_root=config.specialized_hand_input_root,
+            specialized_hand_device=config.specialized_hand_device,
+            specialized_hand_detector_conf=config.specialized_hand_detector_conf,
+            specialized_hand_rescale_factor=config.specialized_hand_rescale_factor,
+            specialized_hand_wrist_max_dist_px=config.specialized_hand_wrist_max_dist_px,
+            replace_wrist_with_specialized=config.replace_wrist_with_specialized,
+            specialized_hand_debug_vis=config.specialized_hand_debug_vis,
+            specialized_hand_debug_dirname=config.specialized_hand_debug_dirname,
+            specialized_hand_verbose=config.specialized_hand_verbose,
+            wilor_pretrained_dir=config.wilor_pretrained_dir,
+            wilor_repo_id=config.wilor_repo_id,
+        )
+        demo_result = run_demo(demo_cfg)
+        npy_root = demo_result.npy_root.resolve()
 
     frame_inputs = discover_frame_inputs(
         npy_root=npy_root,
         cams=config.cams,
         frame_rel=config.frame_rel,
     )
-    if config.fill_missing_frames and config.frame_rel is None:
+    if config.frame_rel is None:
         frame_inputs = _inject_numeric_gaps(frame_inputs)
 
     if not frame_inputs:
@@ -1194,58 +981,43 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
         ) = _load_fixed_non_pose_mhr_params(
             npy_dir=ref_npy_dir,
             cam=fixed_cam,
-            include_hand_pose=bool(config.fixed_hand_pose_from_reference),
+            include_hand_pose=False,
         )
         print(
             "[PIPELINE] Using fixed non-pose MHR params from "
             f"frame_index={ref_idx} rel='{ref_entry.rel_dir or '.'}' cam='{fixed_cam}'."
         )
-        if not bool(config.fixed_hand_pose_from_reference):
-            print(
-                "[PIPELINE] Hand pose is NOT fixed from reference "
-                "(use --fixed_hand_pose_from_reference to enable)."
-            )
+        print("[PIPELINE] Hand pose remains framewise optimized (not fixed from reference).")
 
-    total_frames = len(frame_inputs)
-    tri_debug_shown_once = False
-    if config.debug_triangulation and (not config.debug_triangulation_every_frame) and total_frames > 1:
-        print(
-            "[PIPELINE] --debug_triangulation enabled for sequence: "
-            "interactive 3D debug will open only for the first processed frame. "
-            "Use --debug_triangulation_every_frame to force every frame."
+    runtime_seed = next(
+        (e for e in frame_inputs if e.npy_dir is not None and len(e.available_cams) >= min_views),
+        None,
+    )
+    if runtime_seed is None:
+        raise FileNotFoundError(
+            f"No frame has enough views (>= {min_views}) for optimization runtime initialization."
         )
-
-    opt_runtime = None
-    if not config.skip_optimization:
-        runtime_seed = next(
-            (e for e in frame_inputs if e.npy_dir is not None and len(e.available_cams) >= min_views),
-            None,
+    runtime_seed_npy_dir = runtime_seed.npy_dir
+    if runtime_seed_npy_dir is None:
+        raise FileNotFoundError(
+            "Optimization runtime initialization failed: runtime seed has no npy_dir."
         )
-        if runtime_seed is None:
-            raise FileNotFoundError(
-                f"No frame has enough views (>= {min_views}) for optimization runtime initialization."
-            )
-        runtime_seed_npy_dir = runtime_seed.npy_dir
-        if runtime_seed_npy_dir is None:
-            raise FileNotFoundError(
-                "Optimization runtime initialization failed: runtime seed has no npy_dir."
-            )
-        runtime_cfg = OptimizationConfig(
-            npz=Path("runtime.npz"),
-            npy_dir=runtime_seed_npy_dir,
-            cams=list(runtime_seed.available_cams),
-            out_npy=Path("runtime.npy"),
-            debug_dir=(optimization_root / "debug_opt"),
-            hf_repo=config.hf_repo,
-            ckpt=opt_ckpt,
-            mhr_pt=opt_mhr_pt,
-            device=config.device,
-            save_debug_artifacts=False,
-            min_valid_points=config.min_valid_points,
-            zero_weight_strategy=config.zero_weight_strategy,
-            freeze_lower_body=config.freeze_lower_body,
-        )
-        opt_runtime = build_optimization_runtime(runtime_cfg)
+    runtime_cfg = OptimizationConfig(
+        npz=Path("runtime.npz"),
+        npy_dir=runtime_seed_npy_dir,
+        cams=list(runtime_seed.available_cams),
+        out_npy=Path("runtime.npy"),
+        debug_dir=(optimization_root / "debug_opt"),
+        hf_repo=config.hf_repo,
+        ckpt=opt_ckpt,
+        mhr_pt=opt_mhr_pt,
+        device=config.device,
+        save_debug_artifacts=False,
+        min_valid_points=config.min_valid_points,
+        zero_weight_strategy=config.zero_weight_strategy,
+        freeze_lower_body=config.freeze_lower_body,
+    )
+    opt_runtime = build_optimization_runtime(runtime_cfg)
 
     prev_good_pose: Optional[np.ndarray] = None
     prev_prev_good_pose: Optional[np.ndarray] = None
@@ -1289,59 +1061,40 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
         rel_img_dir = image_root / rel_dir
         img_dir = rel_img_dir if rel_img_dir.is_dir() else image_root
 
-        if not config.skip_triangulation:
-            if tri_out.exists() and not config.overwrite:
-                print(f"[PIPELINE] Reusing triangulation: {tri_out}")
-            else:
-                try:
-                    tri_debug_enabled = bool(
-                        config.debug_triangulation
-                        and (
-                            config.debug_triangulation_every_frame
-                            or (not tri_debug_shown_once)
-                        )
-                    )
-                    tri_cfg = TriangulationConfig(
-                        mhr_py=config.mhr_py,
-                        caliscope_toml=config.caliscope_toml,
-                        cams=used_cams,
-                        toml_sections=[cam_to_section[c] for c in used_cams],
-                        npy_dir=str(entry.npy_dir),
-                        out_npz=str(tri_out),
-                        normalized=config.normalized,
-                        pixel=config.pixel,
-                        invert_extrinsics=config.invert_extrinsics,
-                        lm_iters=config.lm_iters,
-                        lm_lambda=config.lm_lambda,
-                        lm_eps=config.lm_eps,
-                        debug=tri_debug_enabled,
-                        debug_dir=str(tri_debug_dir) if tri_debug_dir else None,
-                        img_dir=str(img_dir),
-                        score_type=config.score_type,
-                        huber_delta=config.huber_delta,
-                        inlier_thresh=config.inlier_thresh,
-                        robust_lm=config.robust_lm,
-                        robust_lm_delta=config.robust_lm_delta,
-                    )
-                    run_triangulation(tri_cfg)
-                    if tri_debug_enabled and (not config.debug_triangulation_every_frame):
-                        tri_debug_shown_once = True
-                except Exception as exc:
-                    fr.status = "triangulation_failed"
-                    fr.error = f"{type(exc).__name__}: {exc}"
-                    print(f"[PIPELINE][WARN] Triangulation failed at '{rel_dir}': {fr.error}")
-                    traceback.print_exc()
-                    frame_results.append(fr)
-                    continue
-        elif not tri_out.exists():
-            fr.status = "triangulation_missing"
-            frame_results.append(fr)
-            continue
-
-        if config.skip_optimization:
-            fr.status = "triangulated"
-            frame_results.append(fr)
-            continue
+        if tri_out.exists() and not config.overwrite:
+            print(f"[PIPELINE] Reusing triangulation: {tri_out}")
+        else:
+            try:
+                tri_cfg = TriangulationConfig(
+                    mhr_py=config.mhr_py,
+                    caliscope_toml=config.caliscope_toml,
+                    cams=used_cams,
+                    toml_sections=[cam_to_section[c] for c in used_cams],
+                    npy_dir=str(entry.npy_dir),
+                    out_npz=str(tri_out),
+                    normalized=config.normalized,
+                    pixel=config.pixel,
+                    invert_extrinsics=config.invert_extrinsics,
+                    lm_iters=config.lm_iters,
+                    lm_lambda=config.lm_lambda,
+                    lm_eps=config.lm_eps,
+                    debug=False,
+                    debug_dir=str(tri_debug_dir) if tri_debug_dir else None,
+                    img_dir=str(img_dir),
+                    score_type=config.score_type,
+                    huber_delta=config.huber_delta,
+                    inlier_thresh=config.inlier_thresh,
+                    robust_lm=config.robust_lm,
+                    robust_lm_delta=config.robust_lm_delta,
+                )
+                run_triangulation(tri_cfg)
+            except Exception as exc:
+                fr.status = "triangulation_failed"
+                fr.error = f"{type(exc).__name__}: {exc}"
+                print(f"[PIPELINE][WARN] Triangulation failed at '{rel_dir}': {fr.error}")
+                traceback.print_exc()
+                frame_results.append(fr)
+                continue
 
         optimized_npy = (optimization_root / rel_dir / config.optimized_name).resolve()
         fr.optimized_npy = optimized_npy
@@ -1496,131 +1249,42 @@ def run_full_pipeline(config: FullPipelineConfig) -> FullPipelineResult:
             frame_results.append(fr)
             continue
 
-        if (
-            fr.is_bad_loss
-            and config.recover_bad_frames
-            and prev_good_pose is not None
-            and use_temporal_priors
-            and int(config.bad_frame_max_retries) > 0
-        ):
-            print(f"[PIPELINE] Retrying bad-loss frame '{rel_dir}' with stronger temporal prior")
-            max_retries = max(0, int(config.bad_frame_max_retries))
-            for retry_i in range(max_retries):
-                gain = float(1.0 + (retry_i + 1) * 2.0)
-                try:
-                    retry_cfg = OptimizationConfig(
-                        npz=tri_out,
-                        npy_dir=entry.npy_dir,
-                        cams=used_cams,
-                        out_npy=optimized_npy,
-                        debug_dir=(optimization_root / rel_dir / f"debug_opt_retry_{retry_i + 1}").resolve(),
-                        hf_repo=config.hf_repo,
-                        ckpt=opt_ckpt,
-                        mhr_pt=opt_mhr_pt,
-                        device=config.device,
-                        iters=max(80, int(config.iters * 0.8)),
-                        lr=max(7e-4, config.lr * (0.5 ** (retry_i + 1))),
-                        with_scale=config.with_scale,
-                        huber_m=config.huber_m,
-                        w_pose_reg=config.w_pose_reg,
-                        w_hand_reg=config.w_hand_reg,
-                        w_temporal=max(config.w_temporal * gain, 3e-4),
-                        w_temporal_velocity=max(config.w_temporal_velocity * gain, 2e-4),
-                        w_temporal_accel=max(config.w_temporal_accel * gain, 1e-4),
-                        temporal_init_blend=max(config.temporal_init_blend, 0.9),
-                        temporal_extrapolation=max(config.temporal_extrapolation, 1.0),
-                        init_prev_body_pose=prev_good_pose.copy(),
-                        init_prev_prev_body_pose=None if prev_prev_good_pose is None else prev_prev_good_pose.copy(),
-                        init_prev_sim_scale=prev_good_sim_scale,
-                        init_prev_sim_R=None if prev_good_sim_R is None else prev_good_sim_R.copy(),
-                        init_prev_sim_t=None if prev_good_sim_t is None else prev_good_sim_t.copy(),
-                        fixed_hand_pose_params=None if fixed_hand_params is None else fixed_hand_params.copy(),
-                        fixed_scale_params=None if fixed_scale_params is None else fixed_scale_params.copy(),
-                        fixed_shape_params=None if fixed_shape_params is None else fixed_shape_params.copy(),
-                        fixed_expr_params=None if fixed_expr_params is None else fixed_expr_params.copy(),
-                        optimize_hand_pose=bool(config.optimize_hand_pose),
-                        use_anchor_similarity=bool(config.use_anchor_similarity),
-                        bad_loss_threshold=config.bad_loss_threshold,
-                        bad_data_loss_threshold=config.bad_data_loss_threshold,
-                        bad_loss_growth_ratio=config.bad_loss_growth_ratio,
-                        min_valid_points=config.min_valid_points,
-                        zero_weight_strategy=config.zero_weight_strategy,
-                        freeze_lower_body=config.freeze_lower_body,
-                        topk_print=config.topk_print,
-                        save_debug_artifacts=config.save_opt_debug,
-                    )
-                    retry_res = run_optimization(retry_cfg, runtime=opt_runtime)
-                    improved_total = retry_res.best_loss < (fr.best_loss or float("inf"))
-                    improved_data = (
-                        fr.best_data_loss is None
-                        or retry_res.best_data_loss < float(fr.best_data_loss)
-                    )
-                    if (not retry_res.is_bad_loss) or improved_total or improved_data:
-                        _update_result_from_opt(fr, retry_res)
-                        fr.is_bad_loss = bool(retry_res.is_bad_loss)
-                        fr.status = "recovered_retry" if not retry_res.is_bad_loss else "bad_loss"
-                        if not retry_res.is_bad_loss:
-                            prev_good_pose, prev_prev_good_pose = _push_temporal_pose_history(
-                                prev_pose=prev_good_pose,
-                                prev_prev_pose=prev_prev_good_pose,
-                                new_pose=retry_res.best_pose,
-                            )
-                            prev_good_sim_scale = float(retry_res.sim_scale)
-                            prev_good_sim_R = np.asarray(retry_res.sim_R, dtype=np.float32).copy()
-                            prev_good_sim_t = np.asarray(retry_res.sim_t, dtype=np.float32).copy()
-                            break
-                except Exception as exc:
-                    print(
-                        f"[PIPELINE][WARN] Retry {retry_i + 1}/{max_retries} failed at "
-                        f"'{rel_dir}': {type(exc).__name__}: {exc}"
-                    )
-
         frame_results.append(fr)
 
-    smoothed_dicts: Optional[List[Optional[Dict[str, Any]]]] = None
-    if not config.skip_optimization:
-        frame_dicts = _recover_missing_and_bad_frames(
-            frame_results=frame_results,
-            optimization_root=optimization_root,
-            optimized_name=config.optimized_name,
-            max_edge_copy_span=config.max_edge_recovery_copy_span,
-        ) if config.recover_bad_frames else [
-            (load_npy_dict(fr.optimized_npy) if fr.optimized_npy is not None and fr.optimized_npy.exists() else None)
-            for fr in frame_results
-        ]
+    frame_dicts = _recover_missing_and_bad_frames(
+        frame_results=frame_results,
+        optimization_root=optimization_root,
+        optimized_name=config.optimized_name,
+        max_edge_copy_span=config.max_edge_recovery_copy_span,
+    )
 
-        if config.enable_smoothing:
-            smoothed_dicts = smooth_frame_dict_sequence(
-                frame_dicts,
-                alpha=config.smoothing_alpha,
-                median_window=config.smoothing_median_window,
-                outlier_sigma=config.smoothing_outlier_sigma,
+    smoothed_dicts = smooth_frame_dict_sequence(
+        frame_dicts,
+        alpha=config.smoothing_alpha,
+        median_window=config.smoothing_median_window,
+        outlier_sigma=config.smoothing_outlier_sigma,
+    )
+    for fr, smoothed_entry in zip(frame_results, smoothed_dicts):
+        if smoothed_entry is None:
+            continue
+        smoothed_out = (optimization_root / fr.rel_dir / config.smoothed_name).resolve()
+        save_npy_dict(smoothed_out, smoothed_entry)
+        fr.smoothed_npy = smoothed_out
+
+    if config.save_sequence_mp4:
+        points_seq = extract_keypoint_sequence(smoothed_dicts)
+        if points_seq.shape[0] > 0:
+            mp4_path = (output_root / config.sequence_mp4_name).resolve()
+            ok = save_keypoint_sequence_mp4(
+                points_seq,
+                mp4_path,
+                fps=config.sequence_fps,
+                title="4D Reconstruction",
             )
-            for fr, smoothed_entry in zip(frame_results, smoothed_dicts):
-                if smoothed_entry is None:
-                    continue
-                smoothed_out = (optimization_root / fr.rel_dir / config.smoothed_name).resolve()
-                save_npy_dict(smoothed_out, smoothed_entry)
-                fr.smoothed_npy = smoothed_out
-
-        if config.debug_sequence or config.save_sequence_mp4:
-            seq_source = smoothed_dicts if smoothed_dicts is not None else frame_dicts
-            points_seq = extract_keypoint_sequence(seq_source)
-            if points_seq.shape[0] > 0:
-                if config.save_sequence_mp4:
-                    mp4_path = (output_root / config.sequence_mp4_name).resolve()
-                    ok = save_keypoint_sequence_mp4(
-                        points_seq,
-                        mp4_path,
-                        fps=config.sequence_fps,
-                        title="4D Reconstruction",
-                    )
-                    if ok:
-                        print(f"[PIPELINE] Saved sequence debug mp4: {mp4_path}")
-                    else:
-                        print("[PIPELINE][WARN] Failed to save sequence debug mp4.")
-                if config.debug_sequence:
-                    show_keypoint_sequence_interactive(points_seq, title="4D Reconstruction")
+            if ok:
+                print(f"[PIPELINE] Saved sequence debug mp4: {mp4_path}")
+            else:
+                print("[PIPELINE][WARN] Failed to save sequence debug mp4.")
 
     summary_json = None
     if config.save_summary_json:
