@@ -73,6 +73,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="front",
         help="Camera name used to read fixed non-pose MHR params from --fixed_mhr_param_frame_idx.",
     )
+    ap.add_argument(
+        "--fixed_lower_body_pose_frame_idx",
+        type=int,
+        default=None,
+        help="Optional frame index used as fixed template source for lower-body pose dimensions.",
+    )
+    ap.add_argument(
+        "--fixed_lower_body_pose_cam",
+        type=str,
+        default="front",
+        help="Camera name used to read fixed lower-body pose template from --fixed_lower_body_pose_frame_idx.",
+    )
     ap.add_argument("--freeze_lower_body", action="store_true", help="Freeze lower-body pose dimensions in stage-3 optimization.")
     ap.add_argument("--save_sequence_mp4", action="store_true", help="Export sequence debug MP4.")
     return ap
@@ -126,6 +138,8 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
             "device": getattr(args, "device", "cuda"),
             "fixed_mhr_param_frame_idx": getattr(args, "fixed_mhr_param_frame_idx", None),
             "fixed_mhr_param_cam": str(getattr(args, "fixed_mhr_param_cam", "front")),
+            "fixed_lower_body_pose_frame_idx": getattr(args, "fixed_lower_body_pose_frame_idx", None),
+            "fixed_lower_body_pose_cam": str(getattr(args, "fixed_lower_body_pose_cam", "front")),
             "freeze_lower_body": bool(getattr(args, "freeze_lower_body", False)),
             "min_views": int(getattr(args, "min_views", 2)),
             "save_sequence_mp4": bool(getattr(args, "save_sequence_mp4", False)),

@@ -81,6 +81,8 @@ class FullPipelineConfig:
     temporal_extrapolation: float = 1.0
     fixed_mhr_param_frame_idx: Optional[int] = None
     fixed_mhr_param_cam: str = "front"
+    fixed_lower_body_pose_frame_idx: Optional[int] = None
+    fixed_lower_body_pose_cam: str = "front"
     fixed_hand_pose_from_reference: bool = False
     optimize_hand_pose: bool = True
     use_anchor_similarity: bool = True

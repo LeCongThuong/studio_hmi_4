@@ -231,8 +231,11 @@ def run_optimization(
             device=device,
         )
 
+    use_fixed_lower_body_pose = config.fixed_lower_body_pose_params is not None
+    lock_lower_body_pose = bool(config.freeze_lower_body) or use_fixed_lower_body_pose
+    lower_idxs_t: Optional[torch.Tensor] = None
     optimize_mask = base_keep_mask.clone()
-    if config.freeze_lower_body:
+    if lock_lower_body_pose:
         lower_idxs_np = resolve_lower_body_pose_indices(pose_dim=pose_dim)
         if lower_idxs_np.size > 0:
             lower_idxs_t = torch.from_numpy(lower_idxs_np).to(device=device, dtype=torch.long)
@@ -241,6 +244,19 @@ def run_optimization(
     init_pose_ref = init_pose_raw.clone()
     init_hand_ref = init_hand.clone()
     frozen_pose_target = init_pose_raw.clone()
+    if use_fixed_lower_body_pose:
+        fixed_lower_body_pose = to_torch(config.fixed_lower_body_pose_params, device).flatten().to(torch.float32)
+        if int(fixed_lower_body_pose.numel()) != pose_dim:
+            raise ValueError(
+                "fixed_lower_body_pose_params dim mismatch: "
+                f"expected {pose_dim}, got {int(fixed_lower_body_pose.numel())}"
+            )
+        if lower_idxs_t is not None and int(lower_idxs_t.numel()) > 0:
+            frozen_pose_target.index_copy_(
+                0,
+                lower_idxs_t,
+                fixed_lower_body_pose.index_select(0, lower_idxs_t),
+            )
     temporal_prev_np = config.init_prev_body_pose
     if temporal_prev_np is None:
         temporal_prev_np = config.init_body_pose
@@ -267,7 +283,7 @@ def run_optimization(
         blend = float(np.clip(config.temporal_init_blend, 0.0, 1.0))
         blend_mask = optimize_mask * blend
         init_pose_ref = init_pose_ref * (1.0 - blend_mask) + init_target * blend_mask
-        if config.freeze_lower_body:
+        if config.freeze_lower_body and not use_fixed_lower_body_pose:
             frozen_pose_target = torch.where(
                 optimize_mask == 0,
                 temporal_pose,
@@ -514,7 +530,7 @@ def run_optimization(
         out_s, out_R, out_t = fit_s, fit_R, fit_t
         reused_prev_similarity = False
         if (
-            config.freeze_lower_body
+            lock_lower_body_pose
             and config.reuse_prev_similarity_when_freeze_lower_body
             and config.init_prev_sim_scale is not None
             and config.init_prev_sim_R is not None
@@ -656,6 +672,7 @@ def run_optimization(
         out_dict["opt_fixed_scale_params"] = int(config.fixed_scale_params is not None)
         out_dict["opt_fixed_shape_params"] = int(config.fixed_shape_params is not None)
         out_dict["opt_fixed_expr_params"] = int(config.fixed_expr_params is not None)
+        out_dict["opt_fixed_lower_body_pose_params"] = int(use_fixed_lower_body_pose)
 
         is_bad_loss = classify_bad_optimization(
             config=config,

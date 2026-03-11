@@ -150,6 +150,22 @@ def load_fixed_non_pose_mhr_params(
     return hand, scale, shape, expr
 
 
+def load_fixed_body_pose_params(
+    npy_dir: Path,
+    cam: str,
+) -> np.ndarray:
+    npy_path = find_existing_with_exts(npy_dir, cam, NP_EXTS)
+    if npy_path is None:
+        raise FileNotFoundError(f"Could not find fixed lower-body source file for cam='{cam}' in {npy_dir}")
+    d = load_npy_dict(npy_path)
+    if "body_pose_params" not in d:
+        raise KeyError(f"Fixed lower-body source is missing 'body_pose_params' (file: {npy_path})")
+    body_pose = np.asarray(d["body_pose_params"], dtype=np.float32).reshape(-1)
+    if not np.isfinite(body_pose).all():
+        raise ValueError(f"Non-finite body_pose_params in fixed lower-body source: {npy_path}")
+    return body_pose
+
+
 def push_temporal_pose_history(
     prev_pose: Optional[np.ndarray],
     prev_prev_pose: Optional[np.ndarray],

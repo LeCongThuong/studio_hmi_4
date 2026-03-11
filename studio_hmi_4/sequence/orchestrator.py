@@ -20,6 +20,7 @@ from .discovery import (
     inject_numeric_gaps,
 )
 from .recovery import (
+    load_fixed_body_pose_params,
     load_fixed_non_pose_mhr_params,
     load_similarity_if_good,
     load_stage1_meta,
@@ -139,20 +140,26 @@ def run_full_pipeline(
     fixed_scale_params = None
     fixed_shape_params = None
     fixed_expr_params = None
-    if config.fixed_mhr_param_frame_idx is not None:
-        ref_idx = int(config.fixed_mhr_param_frame_idx)
+    fixed_lower_body_pose_params = None
+
+    def _find_reference_entry(frame_idx: int, flag_name: str):
         ref_entry = next(
             (
                 entry
                 for entry in frame_inputs
-                if entry.frame_index is not None and int(entry.frame_index) == ref_idx and entry.npy_dir is not None
+                if entry.frame_index is not None and int(entry.frame_index) == int(frame_idx) and entry.npy_dir is not None
             ),
             None,
         )
         if ref_entry is None or ref_entry.npy_dir is None:
             raise FileNotFoundError(
-                f"Could not find frame index {ref_idx} with available npy inputs for --fixed_mhr_param_frame_idx."
+                f"Could not find frame index {int(frame_idx)} with available npy inputs for {flag_name}."
             )
+        return ref_entry
+
+    if config.fixed_mhr_param_frame_idx is not None:
+        ref_idx = int(config.fixed_mhr_param_frame_idx)
+        ref_entry = _find_reference_entry(ref_idx, "--fixed_mhr_param_frame_idx")
         fixed_cam = str(config.fixed_mhr_param_cam).strip()
         if fixed_cam == "":
             raise ValueError("--fixed_mhr_param_cam cannot be empty.")
@@ -172,6 +179,26 @@ def run_full_pipeline(
         )
         print("[PIPELINE] Hand pose remains framewise optimized (not fixed from reference).")
 
+    if config.fixed_lower_body_pose_frame_idx is not None:
+        ref_idx = int(config.fixed_lower_body_pose_frame_idx)
+        ref_entry = _find_reference_entry(ref_idx, "--fixed_lower_body_pose_frame_idx")
+        fixed_cam = str(config.fixed_lower_body_pose_cam).strip()
+        if fixed_cam == "":
+            raise ValueError("--fixed_lower_body_pose_cam cannot be empty.")
+        fixed_lower_body_pose_params = load_fixed_body_pose_params(
+            npy_dir=ref_entry.npy_dir,
+            cam=fixed_cam,
+        )
+        print(
+            "[PIPELINE] Using fixed lower-body pose template from "
+            f"frame_index={ref_idx} rel='{ref_entry.rel_dir or '.'}' cam='{fixed_cam}'."
+        )
+        if config.freeze_lower_body:
+            print(
+                "[PIPELINE] --fixed_lower_body_pose_frame_idx is active; "
+                "reference lower-body template overrides --freeze_lower_body temporal lower-body freezing."
+            )
+
     runtime_seed = next((entry for entry in frame_inputs if entry.npy_dir is not None and len(entry.available_cams) >= min_views), None)
     if runtime_seed is None or runtime_seed.npy_dir is None:
         raise FileNotFoundError(
@@ -190,7 +217,7 @@ def run_full_pipeline(
         save_debug_artifacts=False,
         min_valid_points=config.min_valid_points,
         zero_weight_strategy=config.zero_weight_strategy,
-        freeze_lower_body=config.freeze_lower_body,
+        freeze_lower_body=bool(config.freeze_lower_body and fixed_lower_body_pose_params is None),
     )
     opt_runtime = build_optimization_runtime_fn(runtime_cfg)
 
@@ -392,6 +419,9 @@ def run_full_pipeline(
                 fixed_scale_params=None if fixed_scale_params is None else fixed_scale_params.copy(),
                 fixed_shape_params=None if fixed_shape_params is None else fixed_shape_params.copy(),
                 fixed_expr_params=None if fixed_expr_params is None else fixed_expr_params.copy(),
+                fixed_lower_body_pose_params=(
+                    None if fixed_lower_body_pose_params is None else fixed_lower_body_pose_params.copy()
+                ),
                 optimize_hand_pose=bool(config.optimize_hand_pose),
                 use_anchor_similarity=bool(config.use_anchor_similarity),
                 bad_loss_threshold=config.bad_loss_threshold,
@@ -399,7 +429,7 @@ def run_full_pipeline(
                 bad_loss_growth_ratio=config.bad_loss_growth_ratio,
                 min_valid_points=config.min_valid_points,
                 zero_weight_strategy=config.zero_weight_strategy,
-                freeze_lower_body=config.freeze_lower_body,
+                freeze_lower_body=bool(config.freeze_lower_body and fixed_lower_body_pose_params is None),
                 topk_print=config.topk_print,
                 save_debug_artifacts=config.save_opt_debug,
             )
