@@ -33,6 +33,8 @@ def public_full_pipeline_defaults() -> Dict[str, Any]:
         "specialized_hand_verbose": False,
         "wilor_pretrained_dir": "",
         "wilor_repo_id": "warmshao/WiLoR-mini",
+        "skip_inference": False,
+        "skip_triangulation": False,
         "triangulated_name": "triangulated.npz",
         "optimized_name": "opt_out.npy",
         "normalized": False,

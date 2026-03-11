@@ -36,6 +36,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--frame_rel", default=None, type=str, help="Optional relative frame dir under inferred npy root.")
     ap.add_argument("--overwrite", action="store_true", default=False, help="Recompute outputs even when they already exist.")
+    ap.add_argument(
+        "--skip_inference",
+        action="store_true",
+        default=False,
+        help="Skip stage-1 inference and reuse existing outputs from <output_root>/inference/npy.",
+    )
+    ap.add_argument(
+        "--skip_triangulation",
+        action="store_true",
+        default=False,
+        help="Skip stage-2 triangulation and reuse existing outputs from <output_root>/triangulation.",
+    )
     ap.add_argument("--min_views", type=int, default=2, help="Minimum available views required per frame.")
     ap.add_argument(
         "--enable_specialized_hand_fusion",
@@ -106,6 +118,8 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
             "specialized_hand_input_root": str(getattr(args, "specialized_hand_input_root", "")),
             "frame_rel": getattr(args, "frame_rel", None),
             "overwrite": bool(getattr(args, "overwrite", False)),
+            "skip_inference": bool(getattr(args, "skip_inference", False)),
+            "skip_triangulation": bool(getattr(args, "skip_triangulation", False)),
             "hf_repo": getattr(args, "hf_repo", None),
             "opt_ckpt": getattr(args, "opt_ckpt", None),
             "opt_mhr_pt": str(getattr(args, "opt_mhr_pt", "")),

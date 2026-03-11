@@ -47,6 +47,8 @@ class FullPipelineConfig:
     wilor_repo_id: str = "warmshao/WiLoR-mini"
     frame_rel: Optional[str] = None
     overwrite: bool = False
+    skip_inference: bool = False
+    skip_triangulation: bool = False
     npy_root: Optional[str] = None
     triangulated_name: str = "triangulated.npz"
     optimized_name: str = "opt_out.npy"

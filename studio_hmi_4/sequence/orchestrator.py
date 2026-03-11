@@ -71,54 +71,63 @@ def run_full_pipeline(
     stage1_meta_path = (inference_root / "stage1_meta.json").resolve()
     expected_meta = expected_stage1_meta(config=config, image_root=image_root)
     reuse_stage1 = False
-    if not config.overwrite and config.frame_rel is not None and inferred_npy_root.is_dir():
-        rel_dir_path = (inferred_npy_root / config.frame_rel).resolve()
-        meta_matches = stage1_meta_matches(
-            existing_meta=load_stage1_meta(stage1_meta_path),
-            expected_meta=expected_meta,
-        )
-        if rel_dir_path.is_dir() and dir_has_min_cam_predictions(rel_dir_path, config.cams, min_views=min_views) and meta_matches:
-            reuse_stage1 = True
-
-    if reuse_stage1:
+    if config.skip_inference:
+        if not inferred_npy_root.is_dir():
+            raise FileNotFoundError(
+                "Requested --skip_inference but existing stage-1 output root was not found: "
+                f"{inferred_npy_root}"
+            )
         npy_root = inferred_npy_root
-        print(f"[PIPELINE] Reusing existing stage-1 outputs at: {npy_root}")
+        print(f"[PIPELINE] Skipping stage-1 inference and reusing existing outputs at: {npy_root}")
     else:
-        demo_cfg = Demo2Config(
-            image_folder=str(image_root),
-            output_folder=str(inference_root),
-            checkpoint_path=config.checkpoint_path,
-            detector_name=config.detector_name,
-            segmentor_name=config.segmentor_name,
-            fov_name=config.fov_name,
-            detector_path=config.detector_path,
-            segmentor_path=config.segmentor_path,
-            fov_path=config.fov_path,
-            mhr_path=config.mhr_path,
-            bbox_thresh=config.bbox_thresh,
-            use_mask=config.use_mask,
-            debug=config.debug_inference,
-            save_mhr_params=config.save_mhr_params,
-            include_rel_dirs=[config.frame_rel] if config.frame_rel else None,
-            person_select_strategy=config.person_select_strategy,
-            person_index=config.person_index,
-            enable_specialized_hand_fusion=config.enable_specialized_hand_fusion,
-            specialized_hand_source=config.specialized_hand_source,
-            specialized_hand_model=config.specialized_hand_model,
-            specialized_hand_input_root=config.specialized_hand_input_root,
-            specialized_hand_device=config.specialized_hand_device,
-            specialized_hand_detector_conf=config.specialized_hand_detector_conf,
-            specialized_hand_rescale_factor=config.specialized_hand_rescale_factor,
-            specialized_hand_wrist_max_dist_px=config.specialized_hand_wrist_max_dist_px,
-            replace_wrist_with_specialized=config.replace_wrist_with_specialized,
-            specialized_hand_debug_vis=config.specialized_hand_debug_vis,
-            specialized_hand_debug_dirname=config.specialized_hand_debug_dirname,
-            specialized_hand_verbose=config.specialized_hand_verbose,
-            wilor_pretrained_dir=config.wilor_pretrained_dir,
-            wilor_repo_id=config.wilor_repo_id,
-        )
-        demo_result = run_demo_fn(demo_cfg)
-        npy_root = demo_result.npy_root.resolve()
+        if not config.overwrite and config.frame_rel is not None and inferred_npy_root.is_dir():
+            rel_dir_path = (inferred_npy_root / config.frame_rel).resolve()
+            meta_matches = stage1_meta_matches(
+                existing_meta=load_stage1_meta(stage1_meta_path),
+                expected_meta=expected_meta,
+            )
+            if rel_dir_path.is_dir() and dir_has_min_cam_predictions(rel_dir_path, config.cams, min_views=min_views) and meta_matches:
+                reuse_stage1 = True
+
+        if reuse_stage1:
+            npy_root = inferred_npy_root
+            print(f"[PIPELINE] Reusing existing stage-1 outputs at: {npy_root}")
+        else:
+            demo_cfg = Demo2Config(
+                image_folder=str(image_root),
+                output_folder=str(inference_root),
+                checkpoint_path=config.checkpoint_path,
+                detector_name=config.detector_name,
+                segmentor_name=config.segmentor_name,
+                fov_name=config.fov_name,
+                detector_path=config.detector_path,
+                segmentor_path=config.segmentor_path,
+                fov_path=config.fov_path,
+                mhr_path=config.mhr_path,
+                bbox_thresh=config.bbox_thresh,
+                use_mask=config.use_mask,
+                debug=config.debug_inference,
+                save_mhr_params=config.save_mhr_params,
+                include_rel_dirs=[config.frame_rel] if config.frame_rel else None,
+                person_select_strategy=config.person_select_strategy,
+                person_index=config.person_index,
+                enable_specialized_hand_fusion=config.enable_specialized_hand_fusion,
+                specialized_hand_source=config.specialized_hand_source,
+                specialized_hand_model=config.specialized_hand_model,
+                specialized_hand_input_root=config.specialized_hand_input_root,
+                specialized_hand_device=config.specialized_hand_device,
+                specialized_hand_detector_conf=config.specialized_hand_detector_conf,
+                specialized_hand_rescale_factor=config.specialized_hand_rescale_factor,
+                specialized_hand_wrist_max_dist_px=config.specialized_hand_wrist_max_dist_px,
+                replace_wrist_with_specialized=config.replace_wrist_with_specialized,
+                specialized_hand_debug_vis=config.specialized_hand_debug_vis,
+                specialized_hand_debug_dirname=config.specialized_hand_debug_dirname,
+                specialized_hand_verbose=config.specialized_hand_verbose,
+                wilor_pretrained_dir=config.wilor_pretrained_dir,
+                wilor_repo_id=config.wilor_repo_id,
+            )
+            demo_result = run_demo_fn(demo_cfg)
+            npy_root = demo_result.npy_root.resolve()
 
     frame_inputs = discover_frame_inputs(npy_root=npy_root, cams=config.cams, frame_rel=config.frame_rel)
     if config.frame_rel is None:
@@ -227,7 +236,15 @@ def run_full_pipeline(
         rel_img_dir = image_root / rel_dir
         img_dir = rel_img_dir if rel_img_dir.is_dir() else image_root
 
-        if tri_out.exists() and not config.overwrite:
+        if config.skip_triangulation:
+            if not tri_out.exists():
+                fr.status = "triangulation_missing"
+                fr.error = f"Requested --skip_triangulation but file was not found: {tri_out}"
+                print(f"[PIPELINE][WARN] {fr.error}")
+                frame_results.append(fr)
+                continue
+            print(f"[PIPELINE] Skipping triangulation and reusing existing output: {tri_out}")
+        elif tri_out.exists() and not config.overwrite:
             print(f"[PIPELINE] Reusing triangulation: {tri_out}")
         else:
             try:
