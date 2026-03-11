@@ -206,12 +206,6 @@ def recover_missing_and_bad_frames(
         if not need_recover:
             continue
 
-        if fr.optimized_npy is not None and fr.optimized_npy.exists():
-            try:
-                fr.optimized_npy.unlink()
-            except Exception:
-                pass
-        fr.optimized_npy = None
         frame_dicts[i] = None
         valid[i] = False
 
@@ -219,9 +213,6 @@ def recover_missing_and_bad_frames(
         next_i = next((j for j in range(i + 1, len(frame_results)) if valid[j] and frame_dicts[j] is not None), None)
         if prev_i is None and next_i is None:
             continue
-
-        out_path = fr.optimized_npy if fr.optimized_npy is not None else (optimization_root / fr.rel_dir / optimized_name).resolve()
-        out_path.parent.mkdir(parents=True, exist_ok=True)
 
         if prev_i is not None and next_i is not None and next_i > prev_i:
             prev_dict = frame_dicts[prev_i]
@@ -250,6 +241,14 @@ def recover_missing_and_bad_frames(
             recovered = copy_frame_dict(next_dict, mode="copy_next")
             fr.status = "recovered_copy_next"
             fr.recovered_from = frame_results[next_i].rel_dir
+
+        out_path = fr.optimized_npy if fr.optimized_npy is not None else (optimization_root / fr.rel_dir / optimized_name).resolve()
+        if fr.optimized_npy is not None and fr.optimized_npy.exists():
+            try:
+                fr.optimized_npy.unlink()
+            except Exception:
+                pass
+        out_path.parent.mkdir(parents=True, exist_ok=True)
 
         for key in (
             "opt_loss_hist",

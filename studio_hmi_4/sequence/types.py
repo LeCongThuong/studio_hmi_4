@@ -82,8 +82,8 @@ class FullPipelineConfig:
     fixed_hand_pose_from_reference: bool = False
     optimize_hand_pose: bool = True
     use_anchor_similarity: bool = True
-    bad_loss_threshold: float = 3e-5
-    bad_data_loss_threshold: float = 2e-5
+    bad_loss_threshold: float = 3e-3
+    bad_data_loss_threshold: float = 2.5e-3
     bad_loss_growth_ratio: float = 1.5
     min_valid_points: int = 6
     zero_weight_strategy: str = "uniform_finite"

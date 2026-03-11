@@ -44,8 +44,8 @@ class OptimizationConfig:
     optimize_hand_pose: bool = True
     w_hand_reg: float = 1e-3
     use_anchor_similarity: bool = True
-    bad_loss_threshold: float = 3e-5
-    bad_data_loss_threshold: float = 2e-5
+    bad_loss_threshold: float = 3e-3
+    bad_data_loss_threshold: float = 2.5e-3
     bad_loss_growth_ratio: float = 1.5
     loss_divergence_ratio: float = 3.0
     min_valid_points: int = 6
