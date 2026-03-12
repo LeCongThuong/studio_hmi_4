@@ -36,7 +36,6 @@ MHR_PARAM_KEYS: Sequence[str] = (
     "expr_params",
 )
 
-
 def resolve_output_folder(image_folder: str, output_folder: str) -> Path:
     if output_folder:
         return Path(output_folder)

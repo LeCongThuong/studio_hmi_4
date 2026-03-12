@@ -64,11 +64,7 @@ These should be hardcoded in code/config and not exposed to users.
 Workflow is fixed to: no retry bad frames, recover by interpolation/copy, hands optimized, anchor similarity on.
 
 - `--bad_frame_max_retries` (remove retry branch entirely)
-- `--w_temporal_velocity` (keep 0 internally)
-- `--w_temporal_accel` (keep 0 internally)
-- `--temporal_extrapolation` (only needed with velocity term)
 - `--no_optimize_hand_pose` (always optimize hands)
-- `--fixed_hand_pose_from_reference` (v2 says do not freeze hand pose)
 - `--no_anchor_similarity` (always use anchor similarity)
 - `--no_recover_bad_frames` (always recover; remove toggle)
 - `--no_fill_missing_frames` (always fill; remove toggle)

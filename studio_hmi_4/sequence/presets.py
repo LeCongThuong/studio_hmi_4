@@ -59,7 +59,6 @@ def public_full_pipeline_defaults() -> Dict[str, Any]:
         "temporal_init_blend": 0.7,
         "fixed_lower_body_pose_frame_idx": None,
         "fixed_lower_body_pose_cam": "front",
-        "fixed_hand_pose_from_reference": False,
         "optimize_hand_pose": True,
         "use_anchor_similarity": True,
         "bad_loss_threshold": 3e-3,

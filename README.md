@@ -199,17 +199,40 @@ python run_full_pipeline.py \
 ### Useful Flags
 
 - `--frame_rel 100`: run only one frame subfolder under inferred `npy` root.
+- `--skip_inference`: reuse existing `<output_root>/inference/npy` instead of rerunning stage 1.
+- `--skip_triangulation`: reuse existing `<output_root>/triangulation/.../triangulated.npz` instead of rerunning stage 2.
 - `--min_views 2`: minimum available views for each frame optimization.
-- `--fixed_mhr_param_frame_idx <idx> --fixed_mhr_param_cam front`: lock non-pose MHR params (`hand/scale/shape/expr`) to one reference frame+camera across the sequence (useful for single-person videos to avoid body-size drift).
+- `--fixed_mhr_param_frame_idx <idx> --fixed_mhr_param_cam front`: lock MHR `scale/shape` to one reference frame+camera across the sequence (useful for single-person videos to avoid body-size drift while keeping expression framewise).
+- `--fixed_lower_body_pose_frame_idx <idx> --fixed_lower_body_pose_cam front`: lock lower-body pose dimensions to one reference frame+camera across the sequence. When enabled, this reference template overrides `--freeze_lower_body` temporal lower-body freezing.
 - `--freeze_lower_body`: lock lower-body dimensions and (for sequence runs) reuse previous-frame similarity alignment for lower-body world stability.
 - `--enable_specialized_hand_fusion --specialized_hand_input_root /path/to/wilor_precomputed`: use precomputed WiLoR hand keypoints in stage-1 fusion.
 - `--save_sequence_mp4`: export sequence debug MP4.
+
+To rerun only optimization for an existing sequence, use:
+
+```bash
+python run_full_pipeline.py \
+  --image_folder /path/to/frames_root \
+  --output_root /path/to/pipeline_out \
+  --cams left front right \
+  --caliscope_toml /path/to/config.toml \
+  --checkpoint_path ./checkpoints/sam-3d-body-dinov3/model.ckpt \
+  --mhr_path ./checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt \
+  --skip_inference \
+  --skip_triangulation \
+  --overwrite
+```
+
+That keeps stage 1 and stage 2 on disk, rebuilds the optimization runtime once, and recomputes only stage 3.
 
 ### Recommended settings for hand-focused mostly-static sequences
 
 - Keep non-pose identity fixed:
   - `--fixed_mhr_param_frame_idx <clean_frame>`
   - `--fixed_mhr_param_cam front`
+- Keep lower-body pose fixed from a clean reference frame:
+  - `--fixed_lower_body_pose_frame_idx <clean_frame>`
+  - `--fixed_lower_body_pose_cam front`
 - Keep lower body stable:
   - `--freeze_lower_body`
 - Keep interpolation enabled for failure recovery:
@@ -288,8 +311,8 @@ python optimize_mhr_pose.py \
   --min_valid_points 6 \
   --zero_weight_strategy uniform_finite \
   --freeze_lower_body \
-  --bad_loss_threshold 3e-5 \
-  --bad_data_loss_threshold 2e-5 \
+  --bad_loss_threshold 3e-3 \
+  --bad_data_loss_threshold 2.5e-3 \
   --debug_dir /path/to/debug_opt \
   --out_npy /path/to/opt_out.npy
 ```

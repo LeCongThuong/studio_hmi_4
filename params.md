@@ -35,7 +35,7 @@ These are the real required inputs for [`run_full_pipeline.py`](/home/love_you/D
 | `--overwrite` | off | on/off | Controls cache reuse | Off is correct for normal iteration | Turn on only when you changed inputs or code |
 | `--enable_specialized_hand_fusion` | off | on/off | Enables WiLoR hand replacement in Stage 1 | Turn on for hand-focused tasks | Compare hand debug overlays before and after |
 | `--specialized_hand_input_root` | empty | valid path | Required when using precomputed hand detections | Use only with WiLoR precompute output | Verify file layout matches `<root>/<rel_dir>/<image>.npy` |
-| `--fixed_mhr_param_frame_idx` | unset | one clean frame index | Fixes scale/shape/expression across sequence | Strongly recommended for one performer | Choose a clean frontal frame with good detections |
+| `--fixed_mhr_param_frame_idx` | unset | one clean frame index | Fixes scale/shape across sequence | Strongly recommended for one performer | Choose a clean frontal frame with good detections |
 | `--fixed_mhr_param_cam` | `front` | camera name | Chooses which camera provides fixed non-pose params | `front` is usually best | Use the camera with the cleanest person crop |
 | `--freeze_lower_body` | off | on/off | Suppresses lower-body jitter in mostly static sequences | Recommended when the performer stands mostly still | Compare lower-body stability in the output meshes |
 | `--save_sequence_mp4` | off | on/off | Saves a quick sequence debug animation | Useful for QA runs | Enable on smaller experiments, disable on bulk runs |
@@ -164,10 +164,7 @@ Relevant script: [`optimize_mhr_pose.py`](/home/love_you/Documents/studio_hmi_4/
 | `--w_pose_reg` | `1e-3` | `1e-4` to `1e-2` | Keeps pose near initialization | Keep near default unless the optimizer overfits noisy GT |
 | `--w_hand_reg` | `1e-3` | `1e-4` to `1e-2` | Keeps hand108 near init | Raise if hand pose becomes unstable |
 | `--w_temporal` | `3e-3` | `0` to `1e-2` | Smooths frame-to-frame pose | Good for sequences, unnecessary for single isolated frames |
-| `--w_temporal_velocity` | `0` | `0` to `1e-2` | Extrapolation-based motion prior | Leave at `0` unless you intentionally re-enable velocity behavior |
-| `--w_temporal_accel` | `0` | `0` to `1e-2` | Acceleration smoothness | Leave at `0` for current repo behavior |
 | `--temporal_init_blend` | `0.7` | `0.4-0.9` | Controls how strongly temporal history shapes initialization | `0.7` is suitable when history is mostly reliable |
-| `--temporal_extrapolation` | `1.0` | `0.5-1.2` | Extrapolation gain for velocity target | Keep at `1.0` if velocity prior is enabled |
 
 ### 6.3 Reliability and masking controls
 

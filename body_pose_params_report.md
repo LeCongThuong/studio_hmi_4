@@ -136,7 +136,7 @@ This gives stable body identity while allowing pose motion updates.
 
 ## 5) Practical integration with current pipeline
 
-Your current local optimizer mainly updates `body_pose_params` (133D) and already supports freezing non-pose blocks (`hand/scale/shape/expr`) when loading fixed params from a reference frame.
+Your current local optimizer mainly updates `body_pose_params` (133D) and already supports freezing `scale/shape` blocks when loading fixed params from a reference frame.
 
 To move toward direct `mhr_model_params` subset optimization:
 

@@ -188,14 +188,6 @@ def run_optimization(
     init_shape = get_param_array(init_dict, "shape_params", device)
     init_expr = get_param_array(init_dict, "expr_params", device)
 
-    if config.fixed_hand_pose_params is not None:
-        fixed_hand = to_torch(config.fixed_hand_pose_params, device).flatten().to(torch.float32)
-        if int(fixed_hand.numel()) != int(init_hand.numel()):
-            raise ValueError(
-                "fixed_hand_pose_params dim mismatch: "
-                f"expected {int(init_hand.numel())}, got {int(fixed_hand.numel())}"
-            )
-        init_hand = fixed_hand
     if config.fixed_scale_params is not None:
         fixed_scale = to_torch(config.fixed_scale_params, device).flatten().to(torch.float32)
         if int(fixed_scale.numel()) != int(init_scale.numel()):
@@ -212,14 +204,6 @@ def run_optimization(
                 f"expected {int(init_shape.numel())}, got {int(fixed_shape.numel())}"
             )
         init_shape = fixed_shape
-    if config.fixed_expr_params is not None:
-        fixed_expr = to_torch(config.fixed_expr_params, device).flatten().to(torch.float32)
-        if int(fixed_expr.numel()) != int(init_expr.numel()):
-            raise ValueError(
-                "fixed_expr_params dim mismatch: "
-                f"expected {int(init_expr.numel())}, got {int(fixed_expr.numel())}"
-            )
-        init_expr = fixed_expr
 
     pose_dim = int(init_pose_raw.numel())
     if int(runtime_keep_mask.numel()) == pose_dim:
@@ -277,7 +261,7 @@ def run_optimization(
                 frozen_pose_target,
             )
 
-    optimize_hand_pose = bool(config.optimize_hand_pose) and (config.fixed_hand_pose_params is None)
+    optimize_hand_pose = bool(config.optimize_hand_pose)
 
     pose = init_pose_ref.clone().detach().requires_grad_(True)
     hand = init_hand_ref.clone().detach()
@@ -626,10 +610,8 @@ def run_optimization(
         out_dict["opt_use_anchor_similarity"] = int(bool(config.use_anchor_similarity))
         out_dict["opt_subset_indices"] = subset_idx
         out_dict["opt_points3d_refined"] = gtM
-        out_dict["opt_fixed_hand_pose_params"] = int(config.fixed_hand_pose_params is not None)
         out_dict["opt_fixed_scale_params"] = int(config.fixed_scale_params is not None)
         out_dict["opt_fixed_shape_params"] = int(config.fixed_shape_params is not None)
-        out_dict["opt_fixed_expr_params"] = int(config.fixed_expr_params is not None)
         out_dict["opt_fixed_lower_body_pose_params"] = int(use_fixed_lower_body_pose)
 
         is_bad_loss = classify_bad_optimization(

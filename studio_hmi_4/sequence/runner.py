@@ -65,13 +65,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--fixed_mhr_param_frame_idx",
         type=int,
         default=None,
-        help="Optional frame index used as fixed source for non-pose MHR params (scale/shape/expr).",
+        help="Optional frame index used as fixed source for MHR scale/shape params.",
     )
     ap.add_argument(
         "--fixed_mhr_param_cam",
         type=str,
         default="front",
-        help="Camera name used to read fixed non-pose MHR params from --fixed_mhr_param_frame_idx.",
+        help="Camera name used to read fixed scale/shape params from --fixed_mhr_param_frame_idx.",
     )
     ap.add_argument(
         "--fixed_lower_body_pose_frame_idx",

@@ -135,10 +135,8 @@ def run_full_pipeline(
     if not frame_inputs:
         raise FileNotFoundError(f"No frame directories with camera predictions {config.cams} found under {npy_root}")
 
-    fixed_hand_params = None
     fixed_scale_params = None
     fixed_shape_params = None
-    fixed_expr_params = None
     fixed_lower_body_pose_params = None
 
     def _find_reference_entry(frame_idx: int, flag_name: str):
@@ -163,20 +161,16 @@ def run_full_pipeline(
         if fixed_cam == "":
             raise ValueError("--fixed_mhr_param_cam cannot be empty.")
         (
-            fixed_hand_params,
             fixed_scale_params,
             fixed_shape_params,
-            fixed_expr_params,
         ) = load_fixed_non_pose_mhr_params(
             npy_dir=ref_entry.npy_dir,
             cam=fixed_cam,
-            include_hand_pose=False,
         )
         print(
-            "[PIPELINE] Using fixed non-pose MHR params from "
+            "[PIPELINE] Using fixed scale/shape MHR params from "
             f"frame_index={ref_idx} rel='{ref_entry.rel_dir or '.'}' cam='{fixed_cam}'."
         )
-        print("[PIPELINE] Hand pose remains framewise optimized (not fixed from reference).")
 
     if config.fixed_lower_body_pose_frame_idx is not None:
         ref_idx = int(config.fixed_lower_body_pose_frame_idx)
@@ -404,10 +398,8 @@ def run_full_pipeline(
                 init_prev_sim_scale=init_prev_sim_scale,
                 init_prev_sim_R=init_prev_sim_R,
                 init_prev_sim_t=init_prev_sim_t,
-                fixed_hand_pose_params=None if fixed_hand_params is None else fixed_hand_params.copy(),
                 fixed_scale_params=None if fixed_scale_params is None else fixed_scale_params.copy(),
                 fixed_shape_params=None if fixed_shape_params is None else fixed_shape_params.copy(),
-                fixed_expr_params=None if fixed_expr_params is None else fixed_expr_params.copy(),
                 fixed_lower_body_pose_params=(
                     None if fixed_lower_body_pose_params is None else fixed_lower_body_pose_params.copy()
                 ),

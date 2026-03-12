@@ -115,15 +115,12 @@ def safe_scalar_int(d: Dict[str, Any], key: str) -> Optional[int]:
 def load_fixed_non_pose_mhr_params(
     npy_dir: Path,
     cam: str,
-    include_hand_pose: bool,
-) -> tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     npy_path = find_existing_with_exts(npy_dir, cam, NP_EXTS)
     if npy_path is None:
         raise FileNotFoundError(f"Could not find fixed-parameter source file for cam='{cam}' in {npy_dir}")
     d = load_npy_dict(npy_path)
-    required = ["scale_params", "shape_params", "expr_params"]
-    if include_hand_pose:
-        required = ["hand_pose_params"] + required
+    required = ["scale_params", "shape_params"]
     missing = [key for key in required if key not in d]
     if missing:
         raise KeyError(
@@ -132,22 +129,14 @@ def load_fixed_non_pose_mhr_params(
             + f" (file: {npy_path})"
         )
 
-    hand: Optional[np.ndarray] = None
-    if include_hand_pose:
-        hand = np.asarray(d["hand_pose_params"], dtype=np.float32).reshape(-1)
     scale = np.asarray(d["scale_params"], dtype=np.float32).reshape(-1)
     shape = np.asarray(d["shape_params"], dtype=np.float32).reshape(-1)
-    expr = np.asarray(d["expr_params"], dtype=np.float32).reshape(-1)
 
-    if hand is not None and not np.isfinite(hand).all():
-        raise ValueError(f"Non-finite hand_pose_params in fixed source: {npy_path}")
     if not np.isfinite(scale).all():
         raise ValueError(f"Non-finite scale_params in fixed source: {npy_path}")
     if not np.isfinite(shape).all():
         raise ValueError(f"Non-finite shape_params in fixed source: {npy_path}")
-    if not np.isfinite(expr).all():
-        raise ValueError(f"Non-finite expr_params in fixed source: {npy_path}")
-    return hand, scale, shape, expr
+    return scale, shape
 
 
 def load_fixed_body_pose_params(

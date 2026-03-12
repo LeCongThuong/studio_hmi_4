@@ -51,10 +51,8 @@ class OptimizationConfig:
     init_prev_sim_R: Optional[np.ndarray] = None
     init_prev_sim_t: Optional[np.ndarray] = None
     reuse_prev_similarity_when_freeze_lower_body: bool = True
-    fixed_hand_pose_params: Optional[np.ndarray] = None
     fixed_scale_params: Optional[np.ndarray] = None
     fixed_shape_params: Optional[np.ndarray] = None
-    fixed_expr_params: Optional[np.ndarray] = None
     fixed_lower_body_pose_params: Optional[np.ndarray] = None
 
 
