@@ -18,7 +18,7 @@ class MHRSubset:
 
 
 class MHRSubsetSelector:
-    """Build name->index mapping and the triangulated hand+arm subset."""
+    """Build name->index mapping and the triangulated hand+arm+torso subset."""
 
     def __init__(self, mhr_py: str):
         mod = import_py_module(mhr_py)
@@ -56,6 +56,9 @@ class MHRSubsetSelector:
             "right_elbow",
             "left_wrist",
             "right_wrist",
+            "neck",
+            "left_acromion",
+            "right_acromion",
         ]
         subset_names = list(right_hand) + list(left_hand) + must
 

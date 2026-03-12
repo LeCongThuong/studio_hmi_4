@@ -238,6 +238,17 @@ class SyntheticShapeTests(unittest.TestCase):
         np.testing.assert_array_equal(resolve_lower_body_pose_indices(133), expected_133)
         np.testing.assert_array_equal(resolve_lower_body_pose_indices(204), expected_204)
 
+    def test_stage2_subset_includes_torso_alignment_points(self):
+        _subset_idx, subset_names = _subset()
+        subset_name_set = {str(name) for name in subset_names.tolist()}
+        self.assertIn("neck", subset_name_set)
+        self.assertIn("left_acromion", subset_name_set)
+        self.assertIn("right_acromion", subset_name_set)
+        self.assertIn("left_elbow", subset_name_set)
+        self.assertIn("right_elbow", subset_name_set)
+        self.assertIn("left_wrist", subset_name_set)
+        self.assertIn("right_wrist", subset_name_set)
+
     def test_root_wrappers_import_from_copied_root(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -339,7 +350,7 @@ class SyntheticShapeTests(unittest.TestCase):
             z = np.load(result.out_npz, allow_pickle=True)
             contract = validate_triangulation_bundle(z)
             self.assertEqual(contract.points3d_refined.shape[1], 3)
-            self.assertEqual(contract.subset_indices.shape[0], 46)
+            self.assertEqual(contract.subset_indices.shape[0], 49)
 
     def test_stage3_optimization_with_fake_runtime(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
