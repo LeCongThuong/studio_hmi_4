@@ -260,29 +260,16 @@ def run_optimization(
     temporal_prev_np = config.init_prev_body_pose
     if temporal_prev_np is None:
         temporal_prev_np = config.init_body_pose
-    temporal_prev_prev_np = config.init_prev_prev_body_pose
 
     temporal_pose = None
-    temporal_prev_prev_pose = None
-    temporal_velocity_target = None
     used_temporal_init = temporal_prev_np is not None
     if temporal_prev_np is not None:
         temporal_pose = to_torch(temporal_prev_np, device).flatten().to(torch.float32)
         if int(temporal_pose.numel()) != pose_dim:
             raise ValueError(f"Temporal pose dim mismatch: expected {pose_dim}, got {int(temporal_pose.numel())}")
-        init_target = temporal_pose
-        if temporal_prev_prev_np is not None:
-            temporal_prev_prev_pose = to_torch(temporal_prev_prev_np, device).flatten().to(torch.float32)
-            if int(temporal_prev_prev_pose.numel()) != pose_dim:
-                raise ValueError(
-                    f"Temporal prev-prev pose dim mismatch: expected {pose_dim}, got {int(temporal_prev_prev_pose.numel())}"
-                )
-            extrap = float(np.clip(config.temporal_extrapolation, 0.0, 2.0))
-            temporal_velocity_target = temporal_pose + extrap * (temporal_pose - temporal_prev_prev_pose)
-            init_target = temporal_velocity_target
         blend = float(np.clip(config.temporal_init_blend, 0.0, 1.0))
         blend_mask = optimize_mask * blend
-        init_pose_ref = init_pose_ref * (1.0 - blend_mask) + init_target * blend_mask
+        init_pose_ref = init_pose_ref * (1.0 - blend_mask) + temporal_pose * blend_mask
         if config.freeze_lower_body and not use_fixed_lower_body_pose:
             frozen_pose_target = torch.where(
                 optimize_mask == 0,
@@ -408,21 +395,11 @@ def run_optimization(
             loss_temporal = config.w_temporal * torch.mean((pose - temporal_pose) ** 2)
         else:
             loss_temporal = torch.zeros((), device=device, dtype=torch.float32)
-        if temporal_velocity_target is not None and config.w_temporal_velocity > 0:
-            loss_temporal_velocity = config.w_temporal_velocity * torch.mean((pose - temporal_velocity_target) ** 2)
-        else:
-            loss_temporal_velocity = torch.zeros((), device=device, dtype=torch.float32)
-        if temporal_pose is not None and temporal_prev_prev_pose is not None and config.w_temporal_accel > 0:
-            prev_vel = temporal_pose - temporal_prev_prev_pose
-            cur_vel = pose - temporal_pose
-            loss_temporal_accel = config.w_temporal_accel * torch.mean((cur_vel - prev_vel) ** 2)
-        else:
-            loss_temporal_accel = torch.zeros((), device=device, dtype=torch.float32)
         if optimize_hand_pose and config.w_hand_reg > 0:
             loss_hand_reg = config.w_hand_reg * torch.mean((hand - init_hand_ref) ** 2)
         else:
             loss_hand_reg = torch.zeros((), device=device, dtype=torch.float32)
-        loss = loss_data + loss_reg + loss_temporal + loss_temporal_velocity + loss_temporal_accel + loss_hand_reg
+        loss = loss_data + loss_reg + loss_temporal + loss_hand_reg
 
         loss.backward()
         with torch.no_grad():
@@ -441,8 +418,6 @@ def run_optimization(
                 f"[{it:04d}] loss={loss_hist[-1]:.6f} "
                 f"data={float(loss_data.detach().cpu().item()):.6f} "
                 f"temporal={float(loss_temporal.detach().cpu().item()):.6f} "
-                f"vel={float(loss_temporal_velocity.detach().cpu().item()):.6f} "
-                f"accel={float(loss_temporal_accel.detach().cpu().item()):.6f} "
                 f"hand_reg={float(loss_hand_reg.detach().cpu().item()):.6f}"
             )
 
@@ -560,25 +535,11 @@ def run_optimization(
             final_temporal = float((config.w_temporal * torch.mean((pose - temporal_pose) ** 2)).detach().cpu().item())
         else:
             final_temporal = 0.0
-        if temporal_velocity_target is not None and config.w_temporal_velocity > 0:
-            final_temporal_velocity = float(
-                (config.w_temporal_velocity * torch.mean((pose - temporal_velocity_target) ** 2)).detach().cpu().item()
-            )
-        else:
-            final_temporal_velocity = 0.0
-        if temporal_pose is not None and temporal_prev_prev_pose is not None and config.w_temporal_accel > 0:
-            prev_vel = temporal_pose - temporal_prev_prev_pose
-            cur_vel = pose - temporal_pose
-            final_temporal_accel = float(
-                (config.w_temporal_accel * torch.mean((cur_vel - prev_vel) ** 2)).detach().cpu().item()
-            )
-        else:
-            final_temporal_accel = 0.0
         if optimize_hand_pose and config.w_hand_reg > 0:
             final_hand_reg = float((config.w_hand_reg * torch.mean((hand - init_hand_ref) ** 2)).detach().cpu().item())
         else:
             final_hand_reg = 0.0
-        final_loss = final_data_loss + final_reg_loss + final_temporal + final_temporal_velocity + final_temporal_accel + final_hand_reg
+        final_loss = final_data_loss + final_reg_loss + final_temporal + final_hand_reg
 
         residual_np = residual_subset.cpu().numpy()
         worst = np.argsort(-residual_np)[: config.topk_print]
@@ -660,12 +621,9 @@ def run_optimization(
         out_dict["opt_data_loss_growth_ratio"] = data_growth
         out_dict["opt_used_temporal_init"] = int(used_temporal_init)
         out_dict["opt_temporal_weight"] = float(config.w_temporal)
-        out_dict["opt_temporal_velocity_weight"] = float(config.w_temporal_velocity)
-        out_dict["opt_temporal_accel_weight"] = float(config.w_temporal_accel)
         out_dict["opt_hand_reg_weight"] = float(config.w_hand_reg)
         out_dict["opt_optimize_hand_pose"] = int(bool(optimize_hand_pose))
         out_dict["opt_use_anchor_similarity"] = int(bool(config.use_anchor_similarity))
-        out_dict["opt_temporal_extrapolation"] = float(config.temporal_extrapolation)
         out_dict["opt_subset_indices"] = subset_idx
         out_dict["opt_points3d_refined"] = gtM
         out_dict["opt_fixed_hand_pose_params"] = int(config.fixed_hand_pose_params is not None)

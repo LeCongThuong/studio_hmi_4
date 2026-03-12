@@ -37,10 +37,6 @@ LOWER_BODY_POSE_IDXS_BY_DIM = {
 ALIGNMENT_ANCHOR_NAMES = {
     "left_shoulder",
     "right_shoulder",
-    "left_elbow",
-    "right_elbow",
-    "left_wrist",
-    "right_wrist",
     "neck",
     "left_acromion",
     "right_acromion",

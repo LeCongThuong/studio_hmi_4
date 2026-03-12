@@ -55,7 +55,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--lr", type=float, default=5e-2)
-    ap.add_argument("--with_scale", action="store_true")
+    ap.add_argument("--with_scale", dest="with_scale", action="store_true", default=True)
+    ap.add_argument("--no_with_scale", dest="with_scale", action="store_false")
     ap.add_argument("--huber_m", type=float, default=0.03, help="Huber delta in meters")
     ap.add_argument("--w_pose_reg", type=float, default=1e-3)
     ap.add_argument(
@@ -64,21 +65,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=3e-3,
         help="Temporal pose prior weight when --init_pose_npy is provided.",
     )
-    ap.add_argument(
-        "--w_temporal_velocity",
-        type=float,
-        default=0.0,
-        help="Weight for temporal velocity target (pose extrapolation from previous 2 frames).",
-    )
-    ap.add_argument(
-        "--w_temporal_accel",
-        type=float,
-        default=0.0,
-        help="Weight for temporal acceleration smoothing when previous 2 frames are available.",
-    )
     ap.add_argument("--w_hand_reg", type=float, default=1e-3, help="Regularization weight for optimized hand108 toward initialization.")
     ap.add_argument("--temporal_init_blend", type=float, default=0.7, help="Blend between per-view init and temporal init pose.")
-    ap.add_argument("--temporal_extrapolation", type=float, default=1.0, help="Extrapolation gain for temporal velocity target using prev and prev-prev poses.")
     ap.add_argument("--no_optimize_hand_pose", action="store_true", help="Disable hand108 optimization.")
     ap.add_argument("--no_anchor_similarity", action="store_true", help="Disable anchor-only similarity and use all supervised points.")
     ap.add_argument("--topk_print", type=int, default=10)
@@ -128,13 +116,10 @@ def namespace_to_config(args: argparse.Namespace) -> OptimizationConfig:
         huber_m=args.huber_m,
         w_pose_reg=args.w_pose_reg,
         w_temporal=args.w_temporal,
-        w_temporal_velocity=args.w_temporal_velocity,
-        w_temporal_accel=args.w_temporal_accel,
         optimize_hand_pose=not args.no_optimize_hand_pose,
         w_hand_reg=args.w_hand_reg,
         use_anchor_similarity=not args.no_anchor_similarity,
         temporal_init_blend=args.temporal_init_blend,
-        temporal_extrapolation=args.temporal_extrapolation,
         topk_print=args.topk_print,
         save_debug_artifacts=not args.no_debug_artifacts,
         min_iters=args.min_iters,

@@ -24,7 +24,6 @@ from .recovery import (
     load_fixed_non_pose_mhr_params,
     load_similarity_if_good,
     load_stage1_meta,
-    push_temporal_pose_history,
     recover_missing_and_bad_frames,
     safe_scalar_float,
     safe_scalar_int,
@@ -222,7 +221,6 @@ def run_full_pipeline(
     opt_runtime = build_optimization_runtime_fn(runtime_cfg)
 
     prev_good_pose = None
-    prev_prev_good_pose = None
     prev_good_sim_scale = None
     prev_good_sim_R = None
     prev_good_sim_t = None
@@ -340,11 +338,7 @@ def run_full_pipeline(
                         fr.recovered_from = rec_from or None
                     else:
                         fr.status = "ok"
-                        prev_good_pose, prev_prev_good_pose = push_temporal_pose_history(
-                            prev_pose=prev_good_pose,
-                            prev_prev_pose=prev_prev_good_pose,
-                            new_pose=pose,
-                        )
+                        prev_good_pose = np.asarray(pose, dtype=np.float32).reshape(-1).copy()
                         sim = load_similarity_if_good(optimized_npy)
                         if sim is not None:
                             prev_good_sim_scale = float(sim[0])
@@ -383,7 +377,6 @@ def run_full_pipeline(
             print(f"[PIPELINE] Temporal priors disabled at '{rel_dir}' after {stale_run} consecutive non-good frames.")
 
         init_prev_body_pose = None if (not use_temporal_priors or prev_good_pose is None) else prev_good_pose.copy()
-        init_prev_prev_body_pose = None if (not use_temporal_priors or prev_prev_good_pose is None) else prev_prev_good_pose.copy()
         init_prev_sim_scale = None if (not use_temporal_priors) else prev_good_sim_scale
         init_prev_sim_R = None if (not use_temporal_priors or prev_good_sim_R is None) else prev_good_sim_R.copy()
         init_prev_sim_t = None if (not use_temporal_priors or prev_good_sim_t is None) else prev_good_sim_t.copy()
@@ -406,12 +399,8 @@ def run_full_pipeline(
                 w_pose_reg=config.w_pose_reg,
                 w_hand_reg=config.w_hand_reg,
                 w_temporal=config.w_temporal,
-                w_temporal_velocity=config.w_temporal_velocity,
-                w_temporal_accel=config.w_temporal_accel,
                 temporal_init_blend=config.temporal_init_blend,
-                temporal_extrapolation=config.temporal_extrapolation,
                 init_prev_body_pose=init_prev_body_pose,
-                init_prev_prev_body_pose=init_prev_prev_body_pose,
                 init_prev_sim_scale=init_prev_sim_scale,
                 init_prev_sim_R=init_prev_sim_R,
                 init_prev_sim_t=init_prev_sim_t,
@@ -438,11 +427,7 @@ def run_full_pipeline(
             fr.status = "bad_loss" if opt_res.is_bad_loss else "ok"
             fr.is_bad_loss = bool(opt_res.is_bad_loss)
             if not opt_res.is_bad_loss:
-                prev_good_pose, prev_prev_good_pose = push_temporal_pose_history(
-                    prev_pose=prev_good_pose,
-                    prev_prev_pose=prev_prev_good_pose,
-                    new_pose=opt_res.best_pose,
-                )
+                prev_good_pose = np.asarray(opt_res.best_pose, dtype=np.float32).reshape(-1).copy()
                 prev_good_sim_scale = float(opt_res.sim_scale)
                 prev_good_sim_R = np.asarray(opt_res.sim_R, dtype=np.float32).copy()
                 prev_good_sim_t = np.asarray(opt_res.sim_t, dtype=np.float32).copy()

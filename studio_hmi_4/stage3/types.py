@@ -25,7 +25,7 @@ class OptimizationConfig:
     device: str = "cuda"
     iters: int = 200
     lr: float = 5e-2
-    with_scale: bool = False
+    with_scale: bool = True
     huber_m: float = 0.03
     w_pose_reg: float = 1e-3
     topk_print: int = 10
@@ -35,12 +35,8 @@ class OptimizationConfig:
     early_stop_tol: float = 1e-6
     init_body_pose: Optional[np.ndarray] = None
     init_prev_body_pose: Optional[np.ndarray] = None
-    init_prev_prev_body_pose: Optional[np.ndarray] = None
     temporal_init_blend: float = 0.7
-    temporal_extrapolation: float = 1.0
     w_temporal: float = 3e-3
-    w_temporal_velocity: float = 0.0
-    w_temporal_accel: float = 0.0
     optimize_hand_pose: bool = True
     w_hand_reg: float = 1e-3
     use_anchor_similarity: bool = True

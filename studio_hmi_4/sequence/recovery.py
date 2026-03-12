@@ -166,16 +166,6 @@ def load_fixed_body_pose_params(
     return body_pose
 
 
-def push_temporal_pose_history(
-    prev_pose: Optional[np.ndarray],
-    prev_prev_pose: Optional[np.ndarray],
-    new_pose: np.ndarray,
-) -> tuple[np.ndarray, Optional[np.ndarray]]:
-    updated_prev = np.asarray(new_pose, dtype=np.float32).reshape(-1).copy()
-    updated_prev_prev = None if prev_pose is None else np.asarray(prev_pose, dtype=np.float32).reshape(-1).copy()
-    return updated_prev, updated_prev_prev
-
-
 def stale_frame_run_length(frame_results: Sequence[FramePipelineResult]) -> int:
     stale = 0
     for fr in reversed(frame_results):
@@ -278,9 +268,6 @@ def recover_missing_and_bad_frames(
             "opt_data_loss_growth_ratio",
             "opt_used_temporal_init",
             "opt_temporal_weight",
-            "opt_temporal_velocity_weight",
-            "opt_temporal_accel_weight",
-            "opt_temporal_extrapolation",
             "opt_sim_reused_prev",
         ):
             recovered.pop(key, None)

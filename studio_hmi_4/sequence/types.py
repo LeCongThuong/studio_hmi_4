@@ -70,15 +70,12 @@ class FullPipelineConfig:
     device: str = "cuda"
     iters: int = 200
     lr: float = 5e-2
-    with_scale: bool = False
+    with_scale: bool = True
     huber_m: float = 0.03
     w_pose_reg: float = 1e-3
     w_hand_reg: float = 1e-3
     w_temporal: float = 3e-3
-    w_temporal_velocity: float = 0.0
-    w_temporal_accel: float = 0.0
     temporal_init_blend: float = 0.7
-    temporal_extrapolation: float = 1.0
     fixed_mhr_param_frame_idx: Optional[int] = None
     fixed_mhr_param_cam: str = "front"
     fixed_lower_body_pose_frame_idx: Optional[int] = None
