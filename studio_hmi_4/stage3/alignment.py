@@ -21,13 +21,32 @@ MHR_PARAM_HAND_IDXS_133 = np.array(
 )
 
 LOWER_BODY_POSE_IDXS_BY_DIM = {
-    133: np.array(list(range(0, 31)) + [124, 125, 126, 127, 128, 129], dtype=np.int64),
+    # Conservative lower-body-only subset verified by perturbation using
+    # inspect_body_pose_param_effects.py at delta=0.05 and delta=0.5.
+    # We intentionally keep only indices that consistently move lower-body
+    # keypoints, instead of the earlier broad heuristic range.
+    133: np.array(
+        [
+            44, 45, 46, 47, 48, 49,
+            53, 54, 55, 56, 57, 58,
+            116, 117, 118, 120, 121, 122,
+            128, 129,
+        ],
+        dtype=np.int64,
+    ),
     204: np.array(
         sorted(
             set(
                 list(range(0, 6))
-                + [6 + i for i in range(0, 31)]
-                + [6 + i for i in [124, 125, 126, 127, 128, 129]]
+                + [
+                    6 + i
+                    for i in [
+                        44, 45, 46, 47, 48, 49,
+                        53, 54, 55, 56, 57, 58,
+                        116, 117, 118, 120, 121, 122,
+                        128, 129,
+                    ]
+                ]
             )
         ),
         dtype=np.int64,

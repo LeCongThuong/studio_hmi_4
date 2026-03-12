@@ -226,6 +226,18 @@ def _build_fake_runtime() -> OptimizationRuntime:
 
 
 class SyntheticShapeTests(unittest.TestCase):
+    def test_lower_body_pose_index_table_matches_verified_subset(self):
+        expected_133 = np.array(
+            [44, 45, 46, 47, 48, 49, 53, 54, 55, 56, 57, 58, 116, 117, 118, 120, 121, 122, 128, 129],
+            dtype=np.int64,
+        )
+        expected_204 = np.array(
+            sorted(set(list(range(0, 6)) + [6 + int(i) for i in expected_133])),
+            dtype=np.int64,
+        )
+        np.testing.assert_array_equal(resolve_lower_body_pose_indices(133), expected_133)
+        np.testing.assert_array_equal(resolve_lower_body_pose_indices(204), expected_204)
+
     def test_root_wrappers_import_from_copied_root(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
