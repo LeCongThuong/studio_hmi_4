@@ -105,6 +105,26 @@ def maybe_denormalize(
     return keypoints
 
 
+def invalidate_points_outside_image(
+    kpts_xy: np.ndarray,
+    w: int,
+    h: int,
+) -> np.ndarray:
+    keypoints = np.asarray(kpts_xy, dtype=np.float64).copy()
+    finite = np.isfinite(keypoints).all(axis=1)
+    if not finite.any():
+        return keypoints
+
+    inside = (
+        (keypoints[:, 0] >= 0.0)
+        & (keypoints[:, 0] < float(w))
+        & (keypoints[:, 1] >= 0.0)
+        & (keypoints[:, 1] < float(h))
+    )
+    keypoints[finite & ~inside] = np.nan
+    return keypoints
+
+
 def read_image(img_dir: Path, cam: str, fallback_size_wh: Tuple[int, int]) -> np.ndarray:
     cv2 = require_cv2("stage-2 image loading")
     path = find_existing_with_exts(img_dir, cam, IMG_EXTS)

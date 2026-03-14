@@ -82,6 +82,7 @@ from studio_hmi_4.sequence.runner import FullPipelineConfig, run_full_pipeline
 from studio_hmi_4.sequence.types import FramePipelineResult
 from studio_hmi_4.stage1.runner import Demo2Config, Demo2RunResult, FrameResult, run_demo
 from studio_hmi_4.stage2.runner import MHRSubsetSelector, TriangulationConfig, run_triangulation
+from studio_hmi_4.stage2.io import invalidate_points_outside_image
 from studio_hmi_4.stage3.runner import (
     ALIGNMENT_ANCHOR_NAMES,
     OptimizationConfig,
@@ -247,6 +248,7 @@ class SyntheticShapeTests(unittest.TestCase):
     def test_stage2_subset_includes_torso_alignment_points(self):
         _subset_idx, subset_names = _subset()
         subset_name_set = {str(name) for name in subset_names.tolist()}
+        self.assertIn("nose", subset_name_set)
         self.assertIn("neck", subset_name_set)
         self.assertIn("left_acromion", subset_name_set)
         self.assertIn("right_acromion", subset_name_set)
@@ -256,6 +258,8 @@ class SyntheticShapeTests(unittest.TestCase):
         self.assertIn("right_wrist", subset_name_set)
         self.assertIn("left_hip", subset_name_set)
         self.assertIn("right_hip", subset_name_set)
+        self.assertIn("left_knee", subset_name_set)
+        self.assertIn("right_ankle", subset_name_set)
 
     def test_stage3_alignment_anchors_are_torso_only(self):
         self.assertEqual(
@@ -410,7 +414,61 @@ class SyntheticShapeTests(unittest.TestCase):
             z = np.load(result.out_npz, allow_pickle=True)
             contract = validate_triangulation_bundle(z)
             self.assertEqual(contract.points3d_refined.shape[1], 3)
-            self.assertEqual(contract.subset_indices.shape[0], 51)
+            self.assertEqual(contract.subset_indices.shape[0], 70)
+
+    def test_stage2_invalidates_out_of_image_keypoints_before_triangulation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            cams = ["left", "front", "right"]
+            npy_dir = tmp_path / "npy"
+            npy_dir.mkdir()
+            toml_path = tmp_path / "cams.toml"
+            _write_simple_toml(toml_path, cams)
+
+            rng = np.random.default_rng(11)
+            points3d = rng.uniform(
+                low=[-0.2, -0.2, 3.0],
+                high=[0.2, 0.2, 4.0],
+                size=(70, 3),
+            ).astype(np.float64)
+            tx_map = {"left": -0.15, "front": 0.0, "right": 0.15}
+            dropped_idx = np.array([13, 14, 15, 18], dtype=np.int64)
+            for cam in cams:
+                pred = _make_stage1_prediction(seed=len(cam) + 100)
+                k2d = _project_points(points3d, tx=tx_map[cam])
+                k2d[dropped_idx, 1] = 2500.0
+                pred["pred_keypoints_2d"] = k2d
+                np.save(npy_dir / f"{cam}.npy", pred, allow_pickle=True)
+
+            out_npz = tmp_path / "triangulated.npz"
+            config = TriangulationConfig(
+                mhr_py="mhr70.py",
+                caliscope_toml=str(toml_path),
+                cams=cams,
+                npy_dir=str(npy_dir),
+                out_npz=str(out_npz),
+            )
+            result = run_triangulation(config)
+            z = np.load(result.out_npz, allow_pickle=True)
+            contract = validate_triangulation_bundle(z)
+            self.assertTrue(np.isnan(contract.points3d_refined[dropped_idx]).all())
+            self.assertTrue(np.isfinite(contract.points3d_refined[0]).all())
+
+    def test_invalidate_points_outside_image_sets_nan_without_clipping(self):
+        kpts = np.array(
+            [
+                [10.0, 10.0],
+                [50.0, -1.0],
+                [120.0, 80.0],
+                [30.0, 200.0],
+            ],
+            dtype=np.float32,
+        )
+        out = invalidate_points_outside_image(kpts, w=100, h=100)
+        np.testing.assert_allclose(out[0], np.array([10.0, 10.0], dtype=np.float64))
+        self.assertTrue(np.isnan(out[1]).all())
+        self.assertTrue(np.isnan(out[2]).all())
+        self.assertTrue(np.isnan(out[3]).all())
 
     def test_stage3_optimization_with_fake_runtime(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -8,7 +8,13 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from .camera import CameraModel
-from .io import NP_EXTS, find_existing_with_exts, load_pred_keypoints_2d, maybe_denormalize
+from .io import (
+    NP_EXTS,
+    find_existing_with_exts,
+    invalidate_points_outside_image,
+    load_pred_keypoints_2d,
+    maybe_denormalize,
+)
 from .subset import MHRSubset
 
 
@@ -99,6 +105,7 @@ class TriangulatorBA:
                 force_normalized=self.force_normalized,
                 force_pixel=self.force_pixel,
             )
+            ksub = invalidate_points_outside_image(ksub, w=camera.w, h=camera.h)
 
             self.obs_per_cam[cam] = ksub.astype(np.float64)
             self.und_per_cam[cam] = camera.undistort_to_normalized(ksub)

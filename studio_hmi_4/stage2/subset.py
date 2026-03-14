@@ -18,7 +18,7 @@ class MHRSubset:
 
 
 class MHRSubsetSelector:
-    """Build name->index mapping and the triangulated hand+arm+torso subset."""
+    """Build name->index mapping and the triangulated MHR-70 subset."""
 
     def __init__(self, mhr_py: str):
         mod = import_py_module(mhr_py)
@@ -47,29 +47,25 @@ class MHRSubsetSelector:
         return name_to_idx
 
     def build_subset(self) -> MHRSubset:
-        left_hand = self.pose_info.get("left_hand_keypoint_names", [])
-        right_hand = self.pose_info.get("right_hand_keypoint_names", [])
-        must = [
-            "left_shoulder",
-            "right_shoulder",
-            "left_elbow",
-            "right_elbow",
-            "left_wrist",
-            "right_wrist",
-            "left_hip",
-            "right_hip",
-            "neck",
-            "left_acromion",
-            "right_acromion",
-        ]
-        subset_names = list(right_hand) + list(left_hand) + must
+        keypoint_info = self.pose_info.get("keypoint_info", {})
+        if not isinstance(keypoint_info, dict) or len(keypoint_info) == 0:
+            raise AttributeError("pose_info['keypoint_info'] must be a non-empty dict.")
 
+        ordered_items = sorted((int(idx), value) for idx, value in keypoint_info.items())
+        subset_names = []
         idxs: List[int] = []
-        for name in subset_names:
-            if name not in self.name_to_idx:
-                sample = sorted(list(self.name_to_idx.keys()))[:40]
-                raise KeyError(f"Keypoint name not found: {name}\nExample available names: {sample} ...")
-            idxs.append(int(self.name_to_idx[name]))
+        for idx, value in ordered_items:
+            if not isinstance(value, dict) or "name" not in value:
+                raise KeyError(f"Keypoint entry {idx} is missing a 'name' field.")
+            subset_names.append(str(value["name"]))
+            idxs.append(int(idx))
+
+        if len(set(idxs)) != len(idxs):
+            sample = subset_names[:20]
+            raise RuntimeError(
+                "Full MHR subset contains duplicate indices. "
+                f"subset_size={len(subset_names)} sample={sample}"
+            )
 
         subset_indices = np.array(idxs, dtype=np.int32)
         return MHRSubset(
