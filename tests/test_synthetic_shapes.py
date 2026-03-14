@@ -248,6 +248,8 @@ class SyntheticShapeTests(unittest.TestCase):
         self.assertIn("right_elbow", subset_name_set)
         self.assertIn("left_wrist", subset_name_set)
         self.assertIn("right_wrist", subset_name_set)
+        self.assertIn("left_hip", subset_name_set)
+        self.assertIn("right_hip", subset_name_set)
 
     def test_root_wrappers_import_from_copied_root(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

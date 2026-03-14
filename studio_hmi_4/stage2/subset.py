@@ -56,6 +56,8 @@ class MHRSubsetSelector:
             "right_elbow",
             "left_wrist",
             "right_wrist",
+            "left_hip",
+            "right_hip",
             "neck",
             "left_acromion",
             "right_acromion",
