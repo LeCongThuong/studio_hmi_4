@@ -271,10 +271,10 @@ class SyntheticShapeTests(unittest.TestCase):
         local_names = [str(subset_names[idx]) for idx in local_idx.tolist()]
         self.assertEqual(
             local_names,
-            ["left_hip", "right_hip", "neck", "left_acromion", "right_acromion"],
+            ["left_hip", "right_hip", "left_acromion", "right_acromion", "neck"],
         )
 
-    def test_stage3_loss_weights_downweight_torso_and_shoulders(self):
+    def test_stage3_loss_weights_cover_full_body_with_arm_priority(self):
         _subset_idx, subset_names = _subset()
         weights = build_subset_loss_weights(subset_names)
         mapping = {
@@ -282,11 +282,15 @@ class SyntheticShapeTests(unittest.TestCase):
             for idx, name in enumerate(subset_names.tolist())
         }
 
+        self.assertEqual(len(mapping), 70)
         for name, value in SUBSET_LOSS_WEIGHT_BY_NAME.items():
             self.assertAlmostEqual(mapping[name], value, places=6)
-        for name, value in mapping.items():
-            if name not in SUBSET_LOSS_WEIGHT_BY_NAME:
-                self.assertEqual(value, 1.0)
+        self.assertEqual(set(mapping.keys()), set(SUBSET_LOSS_WEIGHT_BY_NAME.keys()))
+        self.assertGreater(mapping["left_wrist"], mapping["left_knee"])
+        self.assertGreater(mapping["right_elbow"], mapping["neck"])
+        self.assertGreater(mapping["left_thumb4"], mapping["left_shoulder"])
+        self.assertGreater(mapping["right_forefinger4"], mapping["right_hip"])
+        self.assertGreater(mapping["left_acromion"], mapping["nose"])
 
     def test_stage3_uniform_finite_fallback_respects_allowed_mask(self):
         gtM = np.zeros((5, 3), dtype=np.float32)
@@ -977,6 +981,222 @@ class SyntheticShapeTests(unittest.TestCase):
                 result = run_full_pipeline(config)
 
             self.assertTrue(all(frame.status == "ok" for frame in result.frames))
+
+    def test_full_pipeline_optimization_failure_without_neighbors_leaves_no_opt_output(self):
+        from studio_hmi_4.sequence import runner as sequence_runner
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            image_root = tmp_path / "frames"
+            for cam in ("left", "front"):
+                _write_blank_image(image_root / "0" / f"{cam}.jpg")
+
+            subset_idx, subset_names = _subset()
+            stale_opt = tmp_path / "pipeline_out" / "optimization" / "0" / "opt_out.npy"
+            stale_opt.parent.mkdir(parents=True, exist_ok=True)
+            np.save(stale_opt, _make_stage1_prediction(seed=999), allow_pickle=True)
+            stale_smoothed = stale_opt.parent / "opt_out_smoothed.npy"
+            np.save(stale_smoothed, _make_stage1_prediction(seed=1000), allow_pickle=True)
+
+            def fake_run_demo(config):
+                output_root = Path(config.output_folder)
+                npy_root = output_root / "npy"
+                frames = []
+                for image_path in sorted(image_root.rglob("*.jpg")):
+                    rel_dir = image_path.parent.relative_to(image_root).as_posix()
+                    cam = image_path.stem
+                    pred = _make_stage1_prediction(seed=len(cam))
+                    out_dir = npy_root / rel_dir
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    out_path = out_dir / f"{cam}.npy"
+                    np.save(out_path, pred, allow_pickle=True)
+                    frames.append(
+                        FrameResult(
+                            image_path=image_path,
+                            rel_dir=rel_dir,
+                            npy_path=out_path,
+                            mhr_params_path=None,
+                            has_prediction=True,
+                        )
+                    )
+                (output_root / "stage1_meta.json").write_text("{}", encoding="utf-8")
+                return Demo2RunResult(
+                    output_root=output_root,
+                    npy_root=npy_root,
+                    render_root=output_root / "render",
+                    mesh_root=output_root / "mesh",
+                    mhr_params_root=None,
+                    frames=frames,
+                )
+
+            def fake_run_triangulation(config):
+                out_npz = Path(config.out_npz)
+                out_npz.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    out_npz,
+                    subset_indices=subset_idx,
+                    subset_names=subset_names,
+                    points3d_refined=np.ones((subset_idx.shape[0], 3), dtype=np.float32),
+                    inlier_mask=np.ones((subset_idx.shape[0], len(config.cams)), dtype=np.uint8),
+                    left_mean_err_px_refined=np.array(0.1, dtype=np.float32),
+                    front_mean_err_px_refined=np.array(0.1, dtype=np.float32),
+                )
+                return None
+
+            def fake_build_runtime(config):
+                return object()
+
+            def fail_run_optimization(config, runtime):
+                raise RuntimeError("synthetic optimization failure")
+
+            with mock.patch.object(sequence_runner, "run_demo", side_effect=fake_run_demo), \
+                mock.patch.object(sequence_runner, "run_triangulation", side_effect=fake_run_triangulation), \
+                mock.patch.object(sequence_runner, "build_optimization_runtime", side_effect=fake_build_runtime), \
+                mock.patch.object(sequence_runner, "run_optimization", side_effect=fail_run_optimization):
+                config = FullPipelineConfig(
+                    image_folder=str(image_root),
+                    output_root=str(tmp_path / "pipeline_out"),
+                    cams=["left", "front"],
+                    caliscope_toml=str(tmp_path / "unused.toml"),
+                    checkpoint_path="dummy.ckpt",
+                    mhr_path="dummy.pt",
+                    hf_repo="fake/repo",
+                    device="cpu",
+                    min_views=2,
+                    overwrite=True,
+                    save_sequence_mp4=False,
+                )
+                result = run_full_pipeline(config)
+
+            self.assertEqual(len(result.frames), 1)
+            self.assertEqual(result.frames[0].status, "optimization_failed")
+            self.assertIsNone(result.frames[0].optimized_npy)
+            self.assertIsNone(result.frames[0].smoothed_npy)
+            self.assertFalse(stale_opt.exists())
+            self.assertFalse(stale_smoothed.exists())
+
+    def test_full_pipeline_optimization_failure_can_be_recovered_to_opt_output(self):
+        from studio_hmi_4.sequence import runner as sequence_runner
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            image_root = tmp_path / "frames"
+            for frame_idx in range(3):
+                for cam in ("left", "front"):
+                    _write_blank_image(image_root / str(frame_idx) / f"{cam}.jpg")
+
+            subset_idx, subset_names = _subset()
+
+            def fake_run_demo(config):
+                output_root = Path(config.output_folder)
+                npy_root = output_root / "npy"
+                frames = []
+                for image_path in sorted(image_root.rglob("*.jpg")):
+                    rel_dir = image_path.parent.relative_to(image_root).as_posix()
+                    cam = image_path.stem
+                    pred = _make_stage1_prediction(seed=int(rel_dir) * 10 + len(cam))
+                    out_dir = npy_root / rel_dir
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    out_path = out_dir / f"{cam}.npy"
+                    np.save(out_path, pred, allow_pickle=True)
+                    frames.append(
+                        FrameResult(
+                            image_path=image_path,
+                            rel_dir=rel_dir,
+                            npy_path=out_path,
+                            mhr_params_path=None,
+                            has_prediction=True,
+                        )
+                    )
+                (output_root / "stage1_meta.json").write_text("{}", encoding="utf-8")
+                return Demo2RunResult(
+                    output_root=output_root,
+                    npy_root=npy_root,
+                    render_root=output_root / "render",
+                    mesh_root=output_root / "mesh",
+                    mhr_params_root=None,
+                    frames=frames,
+                )
+
+            def fake_run_triangulation(config):
+                out_npz = Path(config.out_npz)
+                out_npz.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    out_npz,
+                    subset_indices=subset_idx,
+                    subset_names=subset_names,
+                    points3d_refined=np.ones((subset_idx.shape[0], 3), dtype=np.float32) * float(out_npz.parent.name or 0),
+                    inlier_mask=np.ones((subset_idx.shape[0], len(config.cams)), dtype=np.uint8),
+                    left_mean_err_px_refined=np.array(0.1, dtype=np.float32),
+                    front_mean_err_px_refined=np.array(0.1, dtype=np.float32),
+                )
+                return None
+
+            def fake_build_runtime(config):
+                return object()
+
+            def fake_run_optimization(config, runtime):
+                frame_idx = int(Path(config.out_npy).parent.name)
+                if frame_idx == 1:
+                    raise RuntimeError("synthetic optimization failure")
+                out_path = Path(config.out_npy)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_dict = _make_stage1_prediction(seed=frame_idx)
+                out_dict["pred_keypoints_3d"] = np.full((70, 3), frame_idx, dtype=np.float32)
+                out_dict["pred_vertices"] = np.full((10, 3), frame_idx, dtype=np.float32)
+                out_dict["pred_joint_coords"] = np.full((70, 3), frame_idx, dtype=np.float32)
+                out_dict["pred_global_rots"] = np.tile(np.eye(3, dtype=np.float32), (70, 1, 1))
+                out_dict["opt_is_bad_loss"] = 0
+                out_dict["opt_best_loss"] = 1e-6
+                out_dict["opt_final_loss"] = 1e-6
+                out_dict["opt_best_data_loss"] = 1e-6
+                out_dict["opt_final_data_loss"] = 1e-6
+                out_dict["opt_best_iter"] = 1
+                out_dict["opt_sim_scale"] = 1.0
+                out_dict["opt_sim_R"] = np.eye(3, dtype=np.float32)
+                out_dict["opt_sim_t"] = np.zeros(3, dtype=np.float32)
+                np.save(out_path, out_dict, allow_pickle=True)
+                return OptimizationRunResult(
+                    out_npy=out_path,
+                    debug_dir=out_path.parent / "debug_opt",
+                    best_cam="front",
+                    loss_history=[1e-6],
+                    best_loss=1e-6,
+                    final_loss=1e-6,
+                    best_data_loss=1e-6,
+                    final_data_loss=1e-6,
+                    best_iter=1,
+                    used_temporal_init=frame_idx > 0,
+                    is_bad_loss=False,
+                    best_pose=np.zeros((133,), dtype=np.float32),
+                    sim_scale=1.0,
+                    sim_R=np.eye(3, dtype=np.float32),
+                    sim_t=np.zeros((3,), dtype=np.float32),
+                )
+
+            with mock.patch.object(sequence_runner, "run_demo", side_effect=fake_run_demo), \
+                mock.patch.object(sequence_runner, "run_triangulation", side_effect=fake_run_triangulation), \
+                mock.patch.object(sequence_runner, "build_optimization_runtime", side_effect=fake_build_runtime), \
+                mock.patch.object(sequence_runner, "run_optimization", side_effect=fake_run_optimization):
+                config = FullPipelineConfig(
+                    image_folder=str(image_root),
+                    output_root=str(tmp_path / "pipeline_out"),
+                    cams=["left", "front"],
+                    caliscope_toml=str(tmp_path / "unused.toml"),
+                    checkpoint_path="dummy.ckpt",
+                    mhr_path="dummy.pt",
+                    hf_repo="fake/repo",
+                    device="cpu",
+                    min_views=2,
+                    overwrite=True,
+                    save_sequence_mp4=False,
+                )
+                result = run_full_pipeline(config)
+
+            frame1 = result.frames[1]
+            self.assertEqual(frame1.status, "recovered_interpolated")
+            self.assertIsNotNone(frame1.optimized_npy)
+            self.assertTrue(frame1.optimized_npy.exists())
 
     def test_recovery_preserves_unrecoverable_bad_output(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

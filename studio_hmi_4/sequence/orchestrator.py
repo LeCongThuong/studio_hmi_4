@@ -424,6 +424,19 @@ def run_full_pipeline(
                 prev_good_sim_R = np.asarray(opt_res.sim_R, dtype=np.float32).copy()
                 prev_good_sim_t = np.asarray(opt_res.sim_t, dtype=np.float32).copy()
         except Exception as exc:
+            if optimized_npy.exists():
+                try:
+                    optimized_npy.unlink()
+                except Exception:
+                    pass
+            stale_smoothed = (optimization_root / rel_dir / config.smoothed_name).resolve()
+            if stale_smoothed.exists():
+                try:
+                    stale_smoothed.unlink()
+                except Exception:
+                    pass
+            fr.optimized_npy = None
+            fr.smoothed_npy = None
             fr.status = "optimization_failed"
             fr.error = f"{type(exc).__name__}: {exc}"
             print(f"[PIPELINE][WARN] Optimization failed at '{rel_dir}': {fr.error}")

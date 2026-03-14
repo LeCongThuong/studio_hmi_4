@@ -61,19 +61,113 @@ ALIGNMENT_ANCHOR_NAMES = {
     "right_acromion",
 }
 
-SUBSET_LOSS_WEIGHT_BY_NAME = {
-    "left_hip": 0.1,
-    "right_hip": 0.1,
-    "neck": 0.1,
-    "left_acromion": 0.1,
-    "right_acromion": 0.1,
-    "left_shoulder": 0.15,
-    "right_shoulder": 0.15,
-    "left_elbow": 0.5,
-    "right_elbow": 0.5,
-    "left_wrist": 0.5,
-    "right_wrist": 0.5,
+_FACE_KEYPOINT_NAMES = {
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
 }
+
+_TORSO_KEYPOINT_NAMES = {
+    "neck",
+    "left_hip",
+    "right_hip",
+}
+
+_LOWER_BODY_KEYPOINT_NAMES = {
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+    "left_big_toe",
+    "left_small_toe",
+    "left_heel",
+    "right_big_toe",
+    "right_small_toe",
+    "right_heel",
+}
+
+_ARM_ANCHOR_KEYPOINT_NAMES = {
+    "left_shoulder",
+    "right_shoulder",
+    "left_acromion",
+    "right_acromion",
+    "left_olecranon",
+    "right_olecranon",
+    "left_cubital_fossa",
+    "right_cubital_fossa",
+}
+
+_ARM_JOINT_KEYPOINT_NAMES = {
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+}
+
+_HAND_KEYPOINT_NAMES = {
+    "right_thumb4",
+    "right_thumb3",
+    "right_thumb2",
+    "right_thumb_third_joint",
+    "right_forefinger4",
+    "right_forefinger3",
+    "right_forefinger2",
+    "right_forefinger_third_joint",
+    "right_middle_finger4",
+    "right_middle_finger3",
+    "right_middle_finger2",
+    "right_middle_finger_third_joint",
+    "right_ring_finger4",
+    "right_ring_finger3",
+    "right_ring_finger2",
+    "right_ring_finger_third_joint",
+    "right_pinky_finger4",
+    "right_pinky_finger3",
+    "right_pinky_finger2",
+    "right_pinky_finger_third_joint",
+    "left_thumb4",
+    "left_thumb3",
+    "left_thumb2",
+    "left_thumb_third_joint",
+    "left_forefinger4",
+    "left_forefinger3",
+    "left_forefinger2",
+    "left_forefinger_third_joint",
+    "left_middle_finger4",
+    "left_middle_finger3",
+    "left_middle_finger2",
+    "left_middle_finger_third_joint",
+    "left_ring_finger4",
+    "left_ring_finger3",
+    "left_ring_finger2",
+    "left_ring_finger_third_joint",
+    "left_pinky_finger4",
+    "left_pinky_finger3",
+    "left_pinky_finger2",
+    "left_pinky_finger_third_joint",
+}
+
+
+def _build_default_subset_loss_weight_by_name() -> dict[str, float]:
+    weights: dict[str, float] = {}
+    for name in _FACE_KEYPOINT_NAMES:
+        weights[name] = 0.05
+    for name in _TORSO_KEYPOINT_NAMES:
+        weights[name] = 0.15
+    for name in _LOWER_BODY_KEYPOINT_NAMES:
+        weights[name] = 0.10
+    for name in _ARM_ANCHOR_KEYPOINT_NAMES:
+        weights[name] = 0.25
+    for name in _ARM_JOINT_KEYPOINT_NAMES:
+        weights[name] = 0.60
+    for name in _HAND_KEYPOINT_NAMES:
+        weights[name] = 1.00
+    return weights
+
+
+SUBSET_LOSS_WEIGHT_BY_NAME = _build_default_subset_loss_weight_by_name()
 
 
 @torch.no_grad()
