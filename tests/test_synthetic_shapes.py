@@ -82,6 +82,7 @@ from studio_hmi_4.sequence.runner import FullPipelineConfig, run_full_pipeline
 from studio_hmi_4.sequence.types import FramePipelineResult
 from studio_hmi_4.stage1.runner import Demo2Config, Demo2RunResult, FrameResult, run_demo
 from studio_hmi_4.stage2.runner import MHRSubsetSelector, TriangulationConfig, run_triangulation
+from studio_hmi_4.stage3 import pipeline as stage3_pipeline
 from studio_hmi_4.stage3.runner import (
     ALIGNMENT_ANCHOR_NAMES,
     OptimizationConfig,
@@ -468,6 +469,60 @@ class SyntheticShapeTests(unittest.TestCase):
             )
             self.assertEqual(contract.body_pose_params.shape, (133,))
             self.assertEqual(contract.pred_keypoints_3d.shape, (70, 3))
+
+    def test_stage3_debug_exports_include_mesh_from_params(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            cams = ["left", "front", "right"]
+            npy_dir = tmp_path / "stage1_npy"
+            npy_dir.mkdir()
+            subset_idx, subset_names = _subset()
+            runtime = _build_fake_runtime()
+
+            init_pred = _make_stage1_prediction(seed=31)
+            for cam in cams:
+                np.save(npy_dir / f"{cam}.npy", init_pred, allow_pickle=True)
+
+            device = runtime.device
+            pose = torch.from_numpy(np.asarray(init_pred["body_pose_params"], dtype=np.float32)).to(device)
+            hand = torch.from_numpy(np.asarray(init_pred["hand_pose_params"], dtype=np.float32)).to(device)
+            scale = torch.from_numpy(np.asarray(init_pred["scale_params"], dtype=np.float32)).to(device)
+            shape = torch.from_numpy(np.asarray(init_pred["shape_params"], dtype=np.float32)).to(device)
+            expr = torch.from_numpy(np.asarray(init_pred["expr_params"], dtype=np.float32)).to(device)
+            fk_out = mhr_fk(runtime.head, pose, hand, scale, shape, expr, device, want_verts=True, want_joint=True, want_model_params=True)
+            k70 = apply_repo_camera_flip_xyz(fk_out[1].squeeze(0)[:70]).cpu().numpy()
+            gt_subset = k70[subset_idx]
+
+            npz_path = tmp_path / "triangulated.npz"
+            np.savez_compressed(
+                npz_path,
+                subset_indices=subset_idx,
+                subset_names=subset_names,
+                points3d_refined=gt_subset.astype(np.float32),
+                inlier_mask=np.ones((subset_idx.shape[0], len(cams)), dtype=np.uint8),
+                left_mean_err_px_refined=np.array(0.1, dtype=np.float32),
+                front_mean_err_px_refined=np.array(0.1, dtype=np.float32),
+                right_mean_err_px_refined=np.array(0.1, dtype=np.float32),
+            )
+
+            debug_dir = tmp_path / "debug_opt"
+            out_npy = tmp_path / "opt_out.npy"
+            config = OptimizationConfig(
+                npz=npz_path,
+                npy_dir=npy_dir,
+                cams=cams,
+                out_npy=out_npy,
+                debug_dir=debug_dir,
+                hf_repo="fake/repo",
+                device="cpu",
+                iters=1,
+                save_debug_artifacts=True,
+            )
+            with mock.patch.object(stage3_pipeline, "plot_3d_compare"), \
+                mock.patch.object(stage3_pipeline, "plot_loss_curve"):
+                run_optimization(config, runtime=runtime)
+            self.assertTrue((debug_dir / "mesh_opt_from_params.ply").exists())
+            self.assertTrue((debug_dir / "mesh_opt_aligned.ply").exists())
 
     def test_stage3_optimization_can_fix_lower_body_from_reference_pose(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

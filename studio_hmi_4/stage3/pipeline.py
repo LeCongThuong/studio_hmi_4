@@ -598,8 +598,10 @@ def run_optimization(
 
             faces = init_dict.get("faces", None)
             if faces is not None:
+                write_ply(debug_dir / "mesh_opt_from_params.ply", verts.cpu().numpy(), faces)
                 write_ply(debug_dir / "mesh_opt_aligned.ply", verts_aligned.cpu().numpy(), faces)
             else:
+                write_ply(debug_dir / "verts_opt_from_params.ply", verts.cpu().numpy(), None)
                 write_ply(debug_dir / "verts_opt_aligned.ply", verts_aligned.cpu().numpy(), None)
 
             np.savez_compressed(
