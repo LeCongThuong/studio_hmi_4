@@ -83,13 +83,19 @@ from studio_hmi_4.sequence.types import FramePipelineResult
 from studio_hmi_4.stage1.runner import Demo2Config, Demo2RunResult, FrameResult, run_demo
 from studio_hmi_4.stage2.runner import MHRSubsetSelector, TriangulationConfig, run_triangulation
 from studio_hmi_4.stage3.runner import (
+    ALIGNMENT_ANCHOR_NAMES,
     OptimizationConfig,
     OptimizationRunResult,
     OptimizationRuntime,
+    ZERO_LOSS_WEIGHT_NAMES,
     apply_repo_camera_flip_xyz,
+    build_alignment_anchor_local_indices,
+    build_subset_loss_weights,
     mhr_fk,
+    resolve_valid_indices_for_prediction,
     resolve_lower_body_pose_indices,
     run_optimization,
+    sanitize_subset_and_weights,
 )
 
 
@@ -251,6 +257,59 @@ class SyntheticShapeTests(unittest.TestCase):
         self.assertIn("left_hip", subset_name_set)
         self.assertIn("right_hip", subset_name_set)
 
+    def test_stage3_alignment_anchors_are_torso_only(self):
+        self.assertEqual(
+            ALIGNMENT_ANCHOR_NAMES,
+            {"left_hip", "right_hip", "neck", "left_acromion", "right_acromion"},
+        )
+        _subset_idx, subset_names = _subset()
+        local_idx = build_alignment_anchor_local_indices(subset_names)
+        local_names = [str(subset_names[idx]) for idx in local_idx.tolist()]
+        self.assertEqual(
+            local_names,
+            ["left_hip", "right_hip", "neck", "left_acromion", "right_acromion"],
+        )
+
+    def test_stage3_loss_weights_keep_hands_wrists_and_elbows_only(self):
+        _subset_idx, subset_names = _subset()
+        weights = build_subset_loss_weights(subset_names)
+        mapping = {
+            str(name): float(weights[idx])
+            for idx, name in enumerate(subset_names.tolist())
+        }
+
+        self.assertEqual(int((weights == 0.0).sum()), len(ZERO_LOSS_WEIGHT_NAMES))
+        for name in ZERO_LOSS_WEIGHT_NAMES:
+            self.assertEqual(mapping[name], 0.0)
+        for name, value in mapping.items():
+            if name not in ZERO_LOSS_WEIGHT_NAMES:
+                self.assertEqual(value, 1.0)
+
+    def test_stage3_uniform_finite_fallback_respects_semantic_zero_weights(self):
+        gtM = np.zeros((5, 3), dtype=np.float32)
+        wM = np.zeros((5,), dtype=np.float32)
+        allowed_mask = np.array([1, 1, 1, 0, 0], dtype=bool)
+
+        finite_gt_mask, sanitized_wM, _ = sanitize_subset_and_weights(
+            gtM=gtM,
+            wM=wM,
+            min_valid_points=3,
+            strategy="uniform_finite",
+            allowed_mask=allowed_mask,
+        )
+        np.testing.assert_array_equal(sanitized_wM, np.array([1, 1, 1, 0, 0], dtype=np.float32))
+
+        valid_idx_t, masked_wM_t = resolve_valid_indices_for_prediction(
+            predM=torch.zeros((5, 3), dtype=torch.float32),
+            finite_gt_mask_t=torch.from_numpy(finite_gt_mask),
+            base_wM_t=torch.zeros((5,), dtype=torch.float32),
+            min_valid_points=3,
+            strategy="uniform_finite",
+            allowed_mask_t=torch.from_numpy(allowed_mask),
+        )
+        self.assertEqual(valid_idx_t.tolist(), [0, 1, 2])
+        np.testing.assert_array_equal(masked_wM_t.cpu().numpy(), np.array([1, 1, 1, 0, 0], dtype=np.float32))
+
     def test_root_wrappers_import_from_copied_root(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -352,7 +411,7 @@ class SyntheticShapeTests(unittest.TestCase):
             z = np.load(result.out_npz, allow_pickle=True)
             contract = validate_triangulation_bundle(z)
             self.assertEqual(contract.points3d_refined.shape[1], 3)
-            self.assertEqual(contract.subset_indices.shape[0], 49)
+            self.assertEqual(contract.subset_indices.shape[0], 51)
 
     def test_stage3_optimization_with_fake_runtime(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

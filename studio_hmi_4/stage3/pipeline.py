@@ -18,6 +18,7 @@ from studio_hmi_4.common import (
 from .alignment import (
     build_alignment_anchor_local_indices,
     build_base_keep_mask,
+    build_subset_loss_weights,
     classify_bad_optimization,
     huber,
     resolve_lower_body_pose_indices,
@@ -74,24 +75,36 @@ def run_optimization(
     subset_names = tri_contract.subset_names
     gtM = tri_contract.points3d_refined.astype(np.float32)
     M = gtM.shape[0]
+    semantic_wM = build_subset_loss_weights(subset_names)
 
     if tri_contract.inlier_mask is not None:
-        wM = tri_contract.inlier_mask.astype(np.float32)
-        if wM.ndim == 2:
-            wM = wM.mean(axis=1)
-        wM = np.clip(wM, 0.0, 1.0)
+        raw_wM = tri_contract.inlier_mask.astype(np.float32)
+        if raw_wM.ndim == 2:
+            raw_wM = raw_wM.mean(axis=1)
+        raw_wM = np.clip(raw_wM, 0.0, 1.0)
     else:
-        wM = np.ones((M,), dtype=np.float32)
+        raw_wM = np.ones((M,), dtype=np.float32)
+    semantic_allowed_mask_np = semantic_wM > 1e-8 if semantic_wM.shape[0] == M else np.ones((M,), dtype=bool)
+    loss_wM = raw_wM * semantic_wM if semantic_wM.shape[0] == M else raw_wM.copy()
 
-    finite_gt_mask_np, wM_np, _ = sanitize_subset_and_weights(
+    finite_gt_mask_np, align_wM_np, _ = sanitize_subset_and_weights(
         gtM=gtM,
-        wM=wM,
+        wM=raw_wM,
         min_valid_points=config.min_valid_points,
         strategy=config.zero_weight_strategy,
     )
+    _finite_loss_mask_np, loss_wM_np, _ = sanitize_subset_and_weights(
+        gtM=gtM,
+        wM=loss_wM,
+        min_valid_points=config.min_valid_points,
+        strategy=config.zero_weight_strategy,
+        allowed_mask=semantic_allowed_mask_np,
+    )
     finite_gt_mask_t = torch.from_numpy(finite_gt_mask_np).to(device=device, dtype=torch.bool)
     gtM_t = to_torch(gtM, device)
-    wM_t = to_torch(wM_np, device)
+    align_wM_t = to_torch(align_wM_np, device)
+    loss_wM_t = to_torch(loss_wM_np, device)
+    semantic_allowed_mask_t = torch.from_numpy(semantic_allowed_mask_np).to(device=device, dtype=torch.bool)
     anchor_local_idx_np = (
         build_alignment_anchor_local_indices(subset_names)
         if bool(config.use_anchor_similarity)
@@ -145,12 +158,20 @@ def run_optimization(
         k70 = apply_repo_camera_flip_xyz(keypoints_308[:70])
         predM = k70[subset_idx]
         try:
-            valid_idx_t, wM_view_t = resolve_valid_indices_for_prediction(
+            valid_align_idx_t, align_wM_view_t = resolve_valid_indices_for_prediction(
                 predM=predM,
                 finite_gt_mask_t=finite_gt_mask_t,
-                base_wM_t=wM_t,
+                base_wM_t=align_wM_t,
                 min_valid_points=config.min_valid_points,
                 strategy=config.zero_weight_strategy,
+            )
+            valid_loss_idx_t, loss_wM_view_t = resolve_valid_indices_for_prediction(
+                predM=predM,
+                finite_gt_mask_t=finite_gt_mask_t,
+                base_wM_t=loss_wM_t,
+                min_valid_points=config.min_valid_points,
+                strategy=config.zero_weight_strategy,
+                allowed_mask_t=semantic_allowed_mask_t,
             )
         except RuntimeError:
             view_scores_3d[cam] = float("inf")
@@ -158,20 +179,23 @@ def run_optimization(
             print(f"[score] {cam:>8s}: 3D=inf m   mean_px={view_mean_px[cam]:.3f}   file={npy_path.name}")
             continue
 
-        predM_v = predM.index_select(0, valid_idx_t)
-        gtM_v = gtM_t.index_select(0, valid_idx_t)
-        wM_v = wM_view_t.index_select(0, valid_idx_t)
+        predM_align_v = predM.index_select(0, valid_align_idx_t)
+        gtM_align_v = gtM_t.index_select(0, valid_align_idx_t)
+        align_wM_v = align_wM_view_t.index_select(0, valid_align_idx_t)
         pred_align_v, gt_align_v, w_align_v = select_alignment_subset_tensors(
-            predM_v=predM_v,
-            gtM_v=gtM_v,
-            wM_v=wM_v,
-            valid_idx_t=valid_idx_t,
+            predM_v=predM_align_v,
+            gtM_v=gtM_align_v,
+            wM_v=align_wM_v,
+            valid_idx_t=valid_align_idx_t,
             anchor_local_idx_t=anchor_local_idx_t,
         )
         s, R, t = umeyama_similarity(pred_align_v, gt_align_v, w=w_align_v, with_scale=config.with_scale)
-        predM_aligned_v = s * (predM_v @ R.T) + t[None, :]
-        r = torch.sqrt(((predM_aligned_v - gtM_v) ** 2).sum(dim=1) + 1e-12)
-        score = (wM_v * r).sum() / (wM_v.sum() + 1e-9)
+        predM_loss_v = predM.index_select(0, valid_loss_idx_t)
+        gtM_loss_v = gtM_t.index_select(0, valid_loss_idx_t)
+        loss_wM_v = loss_wM_view_t.index_select(0, valid_loss_idx_t)
+        predM_aligned_v = s * (predM_loss_v @ R.T) + t[None, :]
+        r = torch.sqrt(((predM_aligned_v - gtM_loss_v) ** 2).sum(dim=1) + 1e-12)
+        score = (loss_wM_v * r).sum() / (loss_wM_v.sum() + 1e-9)
 
         view_scores_3d[cam] = float(score.detach().cpu().item())
         view_align[cam] = (float(s.cpu().item()), R.cpu().numpy(), t.cpu().numpy())
@@ -292,24 +316,33 @@ def run_optimization(
             )
             k70_0 = apply_repo_camera_flip_xyz(out0[1].squeeze(0)[:70])
             predM0 = k70_0[subset_idx]
-            valid_idx0_t, wM0_t = resolve_valid_indices_for_prediction(
+            valid_align_idx0_t, align_wM0_t = resolve_valid_indices_for_prediction(
                 predM=predM0,
                 finite_gt_mask_t=finite_gt_mask_t,
-                base_wM_t=wM_t,
+                base_wM_t=align_wM_t,
                 min_valid_points=config.min_valid_points,
                 strategy=config.zero_weight_strategy,
             )
-            predM0_v = predM0.index_select(0, valid_idx0_t)
-            gtM0_v = gtM_t.index_select(0, valid_idx0_t)
-            wM0_v = wM0_t.index_select(0, valid_idx0_t)
+            valid_idx0_t, loss_wM0_t = resolve_valid_indices_for_prediction(
+                predM=predM0,
+                finite_gt_mask_t=finite_gt_mask_t,
+                base_wM_t=loss_wM_t,
+                min_valid_points=config.min_valid_points,
+                strategy=config.zero_weight_strategy,
+                allowed_mask_t=semantic_allowed_mask_t,
+            )
+            predM0_align_v = predM0.index_select(0, valid_align_idx0_t)
+            gtM0_align_v = gtM_t.index_select(0, valid_align_idx0_t)
+            align_wM0_v = align_wM0_t.index_select(0, valid_align_idx0_t)
             pred0_align_v, gt0_align_v, w0_align_v = select_alignment_subset_tensors(
-                predM_v=predM0_v,
-                gtM_v=gtM0_v,
-                wM_v=wM0_v,
-                valid_idx_t=valid_idx0_t,
+                predM_v=predM0_align_v,
+                gtM_v=gtM0_align_v,
+                wM_v=align_wM0_v,
+                valid_idx_t=valid_align_idx0_t,
                 anchor_local_idx_t=anchor_local_idx_t,
             )
             s0, R0, t0 = umeyama_similarity(pred0_align_v, gt0_align_v, w=w0_align_v, with_scale=config.with_scale)
+            predM0_v = predM0.index_select(0, valid_idx0_t)
             predM0_al = s0 * (predM0_v @ R0.T) + t0[None, :]
             plot_3d_compare(
                 gtM[valid_idx0_t.cpu().numpy()],
@@ -348,23 +381,34 @@ def run_optimization(
         k70 = apply_repo_camera_flip_xyz(out[1].squeeze(0)[:70])
         predM = k70[subset_idx]
 
+        valid_align_idx_t, align_wM_masked_t = resolve_valid_indices_for_prediction(
+            predM=predM,
+            finite_gt_mask_t=finite_gt_mask_t,
+            base_wM_t=align_wM_t,
+            min_valid_points=config.min_valid_points,
+            strategy=config.zero_weight_strategy,
+        )
         valid_idx_t, wM_masked_t = resolve_valid_indices_for_prediction(
             predM=predM,
             finite_gt_mask_t=finite_gt_mask_t,
-            base_wM_t=wM_t,
+            base_wM_t=loss_wM_t,
             min_valid_points=config.min_valid_points,
             strategy=config.zero_weight_strategy,
+            allowed_mask_t=semantic_allowed_mask_t,
         )
         predM_v = predM.index_select(0, valid_idx_t)
         gtM_v = gtM_t.index_select(0, valid_idx_t)
         wM_v = wM_masked_t.index_select(0, valid_idx_t)
+        predM_align_v = predM.index_select(0, valid_align_idx_t)
+        gtM_align_v = gtM_t.index_select(0, valid_align_idx_t)
+        align_wM_v = align_wM_masked_t.index_select(0, valid_align_idx_t)
 
         with torch.no_grad():
             pred_align_v, gt_align_v, w_align_v = select_alignment_subset_tensors(
-                predM_v=predM_v.detach(),
-                gtM_v=gtM_v,
-                wM_v=wM_v,
-                valid_idx_t=valid_idx_t,
+                predM_v=predM_align_v.detach(),
+                gtM_v=gtM_align_v,
+                wM_v=align_wM_v,
+                valid_idx_t=valid_align_idx_t,
                 anchor_local_idx_t=anchor_local_idx_t,
             )
             s, R, t = umeyama_similarity(pred_align_v, gt_align_v, w=w_align_v, with_scale=config.with_scale)
@@ -467,22 +511,33 @@ def run_optimization(
         k70 = apply_repo_camera_flip_xyz(keypoints_308[:70])
         predM = k70[subset_idx]
 
+        valid_align_idx_t, align_wM_masked_t = resolve_valid_indices_for_prediction(
+            predM=predM,
+            finite_gt_mask_t=finite_gt_mask_t,
+            base_wM_t=align_wM_t,
+            min_valid_points=config.min_valid_points,
+            strategy=config.zero_weight_strategy,
+        )
         valid_idx_t, wM_masked_t = resolve_valid_indices_for_prediction(
             predM=predM,
             finite_gt_mask_t=finite_gt_mask_t,
-            base_wM_t=wM_t,
+            base_wM_t=loss_wM_t,
             min_valid_points=config.min_valid_points,
             strategy=config.zero_weight_strategy,
+            allowed_mask_t=semantic_allowed_mask_t,
         )
         predM_v = predM.index_select(0, valid_idx_t)
         gtM_v = gtM_t.index_select(0, valid_idx_t)
         wM_v = wM_masked_t.index_select(0, valid_idx_t)
+        predM_align_v = predM.index_select(0, valid_align_idx_t)
+        gtM_align_v = gtM_t.index_select(0, valid_align_idx_t)
+        align_wM_v = align_wM_masked_t.index_select(0, valid_align_idx_t)
 
         pred_align_v, gt_align_v, w_align_v = select_alignment_subset_tensors(
-            predM_v=predM_v,
-            gtM_v=gtM_v,
-            wM_v=wM_v,
-            valid_idx_t=valid_idx_t,
+            predM_v=predM_align_v,
+            gtM_v=gtM_align_v,
+            wM_v=align_wM_v,
+            valid_idx_t=valid_align_idx_t,
             anchor_local_idx_t=anchor_local_idx_t,
         )
         fit_s, fit_R, fit_t = umeyama_similarity(pred_align_v, gt_align_v, w=w_align_v, with_scale=config.with_scale)
@@ -553,7 +608,8 @@ def run_optimization(
                 cams=np.array(cams, dtype=object),
                 subset_idx=subset_idx,
                 gt_subset=gtM,
-                w_subset=wM_np,
+                w_subset=loss_wM_np,
+                w_subset_semantic=semantic_wM.astype(np.float32),
                 init_scores_3d_m=np.array([view_scores_3d[c] for c in cams], dtype=np.float32),
                 init_scores_mean_px=np.array([view_mean_px[c] for c in cams], dtype=np.float32),
                 final_scale=np.array(float(out_s.cpu().item()), dtype=np.float32),

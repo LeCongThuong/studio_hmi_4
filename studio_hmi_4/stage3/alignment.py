@@ -54,15 +54,21 @@ LOWER_BODY_POSE_IDXS_BY_DIM = {
 }
 
 ALIGNMENT_ANCHOR_NAMES = {
-    "left_shoulder",
-    "right_shoulder",
-    "left_elbow",
-    "right_elbow",
-    "left_wrist",
-    "right_wrist",
+    "left_hip",
+    "right_hip",
     "neck",
     "left_acromion",
     "right_acromion",
+}
+
+ZERO_LOSS_WEIGHT_NAMES = {
+    "left_hip",
+    "right_hip",
+    "neck",
+    "left_acromion",
+    "right_acromion",
+    "left_shoulder",
+    "right_shoulder",
 }
 
 
@@ -147,11 +153,25 @@ def build_base_keep_mask(
     return mask
 
 
+def build_subset_loss_weights(
+    subset_names: Optional[np.ndarray],
+) -> np.ndarray:
+    if subset_names is None:
+        return np.ones((0,), dtype=np.float32)
+    names = np.asarray(subset_names).reshape(-1)
+    weights = np.ones((int(names.shape[0]),), dtype=np.float32)
+    for i, name in enumerate(names):
+        if str(name) in ZERO_LOSS_WEIGHT_NAMES:
+            weights[i] = 0.0
+    return weights
+
+
 def sanitize_subset_and_weights(
     gtM: np.ndarray,
     wM: np.ndarray,
     min_valid_points: int,
     strategy: str,
+    allowed_mask: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     gt = np.asarray(gtM, dtype=np.float32)
     if gt.ndim != 2 or gt.shape[1] != 3:
@@ -161,16 +181,22 @@ def sanitize_subset_and_weights(
         raise ValueError(f"Weight count does not match gt points: {w.shape[0]} vs {gt.shape[0]}")
 
     finite = np.isfinite(gt).all(axis=1)
+    allowed = np.ones_like(finite, dtype=bool)
+    if allowed_mask is not None:
+        allowed = np.asarray(allowed_mask, dtype=bool).reshape(-1)
+        if allowed.shape[0] != gt.shape[0]:
+            raise ValueError(f"Allowed-mask count does not match gt points: {allowed.shape[0]} vs {gt.shape[0]}")
     w[~np.isfinite(w)] = 0.0
     w[~finite] = 0.0
+    w[~allowed] = 0.0
     w = np.clip(w, 0.0, 1.0)
 
     min_pts = max(3, int(min_valid_points))
-    nonzero = (w > 1e-8) & finite
+    nonzero = (w > 1e-8) & finite & allowed
     if int(nonzero.sum()) < min_pts:
         if strategy == "uniform_finite":
-            w = np.where(finite, 1.0, 0.0).astype(np.float32)
-            nonzero = finite.copy()
+            w = np.where(finite & allowed, 1.0, 0.0).astype(np.float32)
+            nonzero = (finite & allowed).copy()
         elif strategy == "fail":
             raise RuntimeError(f"Insufficient valid weighted points: {int(nonzero.sum())} < {min_pts}")
         else:
@@ -189,9 +215,12 @@ def resolve_valid_indices_for_prediction(
     base_wM_t: torch.Tensor,
     min_valid_points: int,
     strategy: str,
+    allowed_mask_t: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pred_finite_t = torch.isfinite(predM).all(dim=1)
     finite_pred_gt_t = finite_gt_mask_t & pred_finite_t
+    if allowed_mask_t is not None:
+        finite_pred_gt_t = finite_pred_gt_t & allowed_mask_t
     w_masked = torch.where(finite_pred_gt_t, base_wM_t, torch.zeros_like(base_wM_t))
     valid_t = finite_pred_gt_t & (w_masked > 1e-8)
     min_pts = max(3, int(min_valid_points))
