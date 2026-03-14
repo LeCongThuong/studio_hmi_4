@@ -200,10 +200,7 @@ python run_full_pipeline.py \
 
 - `--frame_rel 100`: run only one frame subfolder under inferred `npy` root.
 - `--skip_inference`: reuse existing `<output_root>/inference/npy` instead of rerunning stage 1.
-- `--skip_triangulation`: reuse existing `<output_root>/triangulation/.../triangulated.npz` instead of rerunning stage 2. This is on by default; use `--no-skip_triangulation` to force stage 2 to run.
-- `--debug_inference`: save stage-1 debug inference artifacts. This is on by default; use `--no-debug_inference` to disable it.
-- `--save_triangulation_debug`: save stage-2 debug artifacts. This is on by default; use `--no-save_triangulation_debug` to disable it.
-- `--save_opt_debug`: save stage-3 optimization debug artifacts. This is on by default; use `--no-save_opt_debug` to disable it.
+- `--skip_triangulation`: reuse existing `<output_root>/triangulation/.../triangulated.npz` instead of rerunning stage 2.
 - `--min_views 2`: minimum available views for each frame optimization.
 - `--fixed_mhr_param_frame_idx <idx> --fixed_mhr_param_cam front`: lock MHR `scale/shape` to one reference frame+camera across the sequence (useful for single-person videos to avoid body-size drift while keeping expression framewise).
 - `--fixed_lower_body_pose_frame_idx <idx> --fixed_lower_body_pose_cam front`: lock lower-body pose dimensions to one reference frame+camera across the sequence. When enabled, this reference template overrides `--freeze_lower_body` temporal lower-body freezing.
