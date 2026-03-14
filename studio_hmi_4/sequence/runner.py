@@ -44,9 +44,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--skip_triangulation",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Skip stage-2 triangulation and reuse existing outputs from <output_root>/triangulation.",
+    )
+    ap.add_argument(
+        "--debug_inference",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable stage-1 debug inference artifacts.",
+    )
+    ap.add_argument(
+        "--save_triangulation_debug",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save stage-2 debug artifacts.",
+    )
+    ap.add_argument(
+        "--save_opt_debug",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save stage-3 optimization debug artifacts.",
     )
     ap.add_argument("--min_views", type=int, default=2, help="Minimum available views required per frame.")
     ap.add_argument(
@@ -131,7 +149,12 @@ def namespace_to_config(args: argparse.Namespace) -> FullPipelineConfig:
             "frame_rel": getattr(args, "frame_rel", None),
             "overwrite": bool(getattr(args, "overwrite", False)),
             "skip_inference": bool(getattr(args, "skip_inference", False)),
-            "skip_triangulation": bool(getattr(args, "skip_triangulation", False)),
+            "skip_triangulation": bool(getattr(args, "skip_triangulation", defaults["skip_triangulation"])),
+            "debug_inference": bool(getattr(args, "debug_inference", defaults["debug_inference"])),
+            "save_triangulation_debug": bool(
+                getattr(args, "save_triangulation_debug", defaults["save_triangulation_debug"])
+            ),
+            "save_opt_debug": bool(getattr(args, "save_opt_debug", defaults["save_opt_debug"])),
             "hf_repo": getattr(args, "hf_repo", None),
             "opt_ckpt": getattr(args, "opt_ckpt", None),
             "opt_mhr_pt": str(getattr(args, "opt_mhr_pt", "")),

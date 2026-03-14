@@ -27,7 +27,7 @@ class FullPipelineConfig:
     fov_path: str = ""
     bbox_thresh: float = 0.8
     use_mask: bool = False
-    debug_inference: bool = False
+    debug_inference: bool = True
     save_mhr_params: bool = False
     person_select_strategy: str = "largest_bbox"
     person_index: int = 0
@@ -48,7 +48,7 @@ class FullPipelineConfig:
     frame_rel: Optional[str] = None
     overwrite: bool = False
     skip_inference: bool = False
-    skip_triangulation: bool = False
+    skip_triangulation: bool = True
     npy_root: Optional[str] = None
     triangulated_name: str = "triangulated.npz"
     optimized_name: str = "opt_out.npy"
@@ -63,7 +63,7 @@ class FullPipelineConfig:
     inlier_thresh: float = 30.0
     robust_lm: bool = False
     robust_lm_delta: float = 10.0
-    save_triangulation_debug: bool = False
+    save_triangulation_debug: bool = True
     hf_repo: Optional[str] = None
     opt_ckpt: Optional[str] = None
     opt_mhr_pt: str = ""
@@ -89,7 +89,7 @@ class FullPipelineConfig:
     zero_weight_strategy: str = "uniform_finite"
     freeze_lower_body: bool = False
     topk_print: int = 10
-    save_opt_debug: bool = False
+    save_opt_debug: bool = True
     min_views: int = 2
     max_stale_temporal_frames: int = 40
     max_edge_recovery_copy_span: int = 15

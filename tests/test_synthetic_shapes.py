@@ -251,6 +251,48 @@ class SyntheticShapeTests(unittest.TestCase):
         self.assertIn("left_hip", subset_name_set)
         self.assertIn("right_hip", subset_name_set)
 
+    def test_full_pipeline_cli_defaults_enable_debug_and_skip_flags(self):
+        from studio_hmi_4.sequence.runner import namespace_to_config, parse_args
+
+        base_argv = [
+            "--image_folder",
+            "/tmp/images",
+            "--output_root",
+            "/tmp/out",
+            "--cams",
+            "left",
+            "front",
+            "right",
+            "--caliscope_toml",
+            "/tmp/config.toml",
+            "--checkpoint_path",
+            "dummy.ckpt",
+            "--mhr_path",
+            "dummy.pt",
+        ]
+
+        config = namespace_to_config(parse_args(base_argv))
+        self.assertTrue(config.debug_inference)
+        self.assertTrue(config.skip_triangulation)
+        self.assertTrue(config.save_triangulation_debug)
+        self.assertTrue(config.save_opt_debug)
+
+        config = namespace_to_config(
+            parse_args(
+                base_argv
+                + [
+                    "--no-debug_inference",
+                    "--no-skip_triangulation",
+                    "--no-save_triangulation_debug",
+                    "--no-save_opt_debug",
+                ]
+            )
+        )
+        self.assertFalse(config.debug_inference)
+        self.assertFalse(config.skip_triangulation)
+        self.assertFalse(config.save_triangulation_debug)
+        self.assertFalse(config.save_opt_debug)
+
     def test_root_wrappers_import_from_copied_root(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
