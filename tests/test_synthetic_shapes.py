@@ -87,7 +87,7 @@ from studio_hmi_4.stage3.runner import (
     OptimizationConfig,
     OptimizationRunResult,
     OptimizationRuntime,
-    ZERO_LOSS_WEIGHT_NAMES,
+    SUBSET_LOSS_WEIGHT_BY_NAME,
     apply_repo_camera_flip_xyz,
     build_alignment_anchor_local_indices,
     build_subset_loss_weights,
@@ -270,7 +270,7 @@ class SyntheticShapeTests(unittest.TestCase):
             ["left_hip", "right_hip", "neck", "left_acromion", "right_acromion"],
         )
 
-    def test_stage3_loss_weights_keep_hands_wrists_and_elbows_only(self):
+    def test_stage3_loss_weights_downweight_torso_and_shoulders(self):
         _subset_idx, subset_names = _subset()
         weights = build_subset_loss_weights(subset_names)
         mapping = {
@@ -278,14 +278,13 @@ class SyntheticShapeTests(unittest.TestCase):
             for idx, name in enumerate(subset_names.tolist())
         }
 
-        self.assertEqual(int((weights == 0.0).sum()), len(ZERO_LOSS_WEIGHT_NAMES))
-        for name in ZERO_LOSS_WEIGHT_NAMES:
-            self.assertEqual(mapping[name], 0.0)
+        for name, value in SUBSET_LOSS_WEIGHT_BY_NAME.items():
+            self.assertAlmostEqual(mapping[name], value, places=6)
         for name, value in mapping.items():
-            if name not in ZERO_LOSS_WEIGHT_NAMES:
+            if name not in SUBSET_LOSS_WEIGHT_BY_NAME:
                 self.assertEqual(value, 1.0)
 
-    def test_stage3_uniform_finite_fallback_respects_semantic_zero_weights(self):
+    def test_stage3_uniform_finite_fallback_respects_allowed_mask(self):
         gtM = np.zeros((5, 3), dtype=np.float32)
         wM = np.zeros((5,), dtype=np.float32)
         allowed_mask = np.array([1, 1, 1, 0, 0], dtype=bool)

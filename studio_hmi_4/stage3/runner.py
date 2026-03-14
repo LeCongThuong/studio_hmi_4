@@ -10,7 +10,7 @@ from typing import List, Optional
 from .alignment import (
     MHR_PARAM_HAND_IDXS_133,
     ALIGNMENT_ANCHOR_NAMES,
-    ZERO_LOSS_WEIGHT_NAMES,
+    SUBSET_LOSS_WEIGHT_BY_NAME,
     build_alignment_anchor_local_indices,
     build_base_keep_mask,
     build_subset_loss_weights,
@@ -151,7 +151,7 @@ __all__ = [
     "OptimizationConfig",
     "OptimizationRunResult",
     "OptimizationRuntime",
-    "ZERO_LOSS_WEIGHT_NAMES",
+    "SUBSET_LOSS_WEIGHT_BY_NAME",
     "apply_repo_camera_flip_xyz",
     "build_alignment_anchor_local_indices",
     "build_base_keep_mask",

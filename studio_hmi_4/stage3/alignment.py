@@ -61,14 +61,18 @@ ALIGNMENT_ANCHOR_NAMES = {
     "right_acromion",
 }
 
-ZERO_LOSS_WEIGHT_NAMES = {
-    "left_hip",
-    "right_hip",
-    "neck",
-    "left_acromion",
-    "right_acromion",
-    "left_shoulder",
-    "right_shoulder",
+SUBSET_LOSS_WEIGHT_BY_NAME = {
+    "left_hip": 0.1,
+    "right_hip": 0.1,
+    "neck": 0.1,
+    "left_acromion": 0.1,
+    "right_acromion": 0.1,
+    "left_shoulder": 0.15,
+    "right_shoulder": 0.15,
+    "left_elbow": 0.5,
+    "right_elbow": 0.5,
+    "left_wrist": 0.5,
+    "right_wrist": 0.5,
 }
 
 
@@ -161,8 +165,7 @@ def build_subset_loss_weights(
     names = np.asarray(subset_names).reshape(-1)
     weights = np.ones((int(names.shape[0]),), dtype=np.float32)
     for i, name in enumerate(names):
-        if str(name) in ZERO_LOSS_WEIGHT_NAMES:
-            weights[i] = 0.0
+        weights[i] = float(SUBSET_LOSS_WEIGHT_BY_NAME.get(str(name), 1.0))
     return weights
 
 
